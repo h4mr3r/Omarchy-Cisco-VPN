@@ -372,7 +372,10 @@ def ensure_profile(address, username, proxy):
         uuid = profile_uuid()
         if not uuid:
             raise VpnError("NetworkManager did not create the VPN profile")
-    connection = NM.Client.new(None).get_connection_by_uuid(uuid)
+    # Keep the client referenced: a RemoteConnection stops working once its
+    # NM.Client is garbage-collected ("Object is no longer in the client cache").
+    client = NM.Client.new(None)
+    connection = client.get_connection_by_uuid(uuid)
     if connection is None or connection.get_setting_vpn() is None:
         raise VpnError("NetworkManager could not read the VPN profile")
     # Merge only the keys this widget owns; keep anything set elsewhere
@@ -624,8 +627,10 @@ def main():
 if __name__ == "__main__":
     try:
         print(json.dumps({"ok": True, **main()}))
-    except GLib.Error:
-        print(json.dumps({"ok": False, "error": "NetworkManager rejected the VPN operation"}))
+    except GLib.Error as error:
+        # NetworkManager's message names the failing step; it carries no secrets.
+        print(json.dumps({"ok": False,
+                          "error": f"NetworkManager rejected the VPN operation: {error.message}"}))
         sys.exit(1)
     except (VpnError, ValueError, KeyError, TypeError) as error:
         print(json.dumps({"ok": False, "error": str(error)}))
