@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "h4mr3r.cisco-vpn",
+  "name": "Cisco VPN",
+  "version": "0.1.0",
+  "author": "h4mr3r",
+  "license": "MIT",
+  "description": "Connect to a Cisco AnyConnect VPN through NetworkManager and OpenConnect.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Cisco VPN",
+    "description": "Connect and disconnect a Cisco AnyConnect VPN.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
