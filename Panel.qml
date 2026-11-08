@@ -239,6 +239,19 @@ Panel {
     runSettings("ignore-certificate", { server: server })
   }
 
+  function toggleIgnoreCertificate() {
+    if (busy || settingsProcess.running) return
+    var server = serverField.text.trim()
+    if (!server) {
+      errorText = "Enter the VPN server first"
+      return
+    }
+    runSettings(certificateIgnored ? "forget-certificate" : "ignore-certificate", { server: server })
+    certificateIgnored = !certificateIgnored
+    if (certificateIgnored) certificatePinned = false
+    errorText = ""
+  }
+
   function dismissCertificate() {
     certificatePrompt = null
     lastConnectRequest = ""
@@ -723,6 +736,18 @@ Panel {
         font.pixelSize: Style.font.bodySmall
       }
 
+      Toggle {
+        visible: root.dependenciesReady && !root.connected
+        width: parent.width
+        label: "Ignore certificate errors"
+        description: "Accept any certificate from this server. Not safe on networks you don't trust: an impostor server would receive your password."
+        checked: root.certificateIgnored
+        foreground: root.barForeground
+        fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+        titleSize: Style.font.bodySmall
+        onClicked: root.toggleIgnoreCertificate()
+      }
+
       Text {
         visible: root.errorText !== ""
         width: parent.width
@@ -799,10 +824,9 @@ Panel {
       }
 
       Button {
-        visible: root.dependenciesReady && (root.certificatePinned || root.certificateIgnored) && !root.connected && root.certificatePrompt === null
+        visible: root.dependenciesReady && root.certificatePinned && !root.certificateIgnored && !root.connected && root.certificatePrompt === null
         enabled: !root.busy && !settingsProcess.running
-        text: root.certificateIgnored ? "Ignoring certificate errors for this server · Stop ignoring"
-                                      : "Using a trusted certificate for this server · Forget"
+        text: "Using a trusted certificate for this server · Forget"
         foreground: root.barForeground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
         fontSize: Style.font.bodySmall
