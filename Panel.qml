@@ -44,6 +44,7 @@ Panel {
   property var certificatePrompt: null
   property string lastConnectRequest: ""
   property bool certificatePinned: false
+  property bool certificateIgnored: false
   readonly property bool forwarderWanted: dependenciesReady && (appsProxy || connected)
   readonly property string forwarderHelper: Qt.resolvedUrl("proxy_forwarder.py").toString().replace(/^file:\/\//, "")
   property bool dependenciesKnown: false
@@ -83,6 +84,7 @@ Panel {
       }
       connected = data.connected === true
       certificatePinned = data.certificatePinned === true
+      certificateIgnored = data.certificateIgnored === true
       if (data.settings && (!opened || !settingsLoaded)) applySettings(data.settings)
       if (showError && data.connected === true) {
         serverDirty = false
@@ -230,6 +232,13 @@ Panel {
     runSettings("trust-certificate", { server: server, fingerprint: certificatePrompt.fingerprint })
   }
 
+  function ignoreCertificateAndConnect() {
+    if (busy || !certificatePrompt || settingsProcess.running) return
+    var server = JSON.parse(lastConnectRequest).server
+    afterSettings = "connect"
+    runSettings("ignore-certificate", { server: server })
+  }
+
   function dismissCertificate() {
     certificatePrompt = null
     lastConnectRequest = ""
@@ -240,6 +249,7 @@ Panel {
     if (busy) return
     runSettings("forget-certificate", { server: serverField.text.trim() })
     certificatePinned = false
+    certificateIgnored = false
   }
 
   function disconnectVpn() {
@@ -729,8 +739,9 @@ Panel {
         width: parent.width
         wrapMode: Text.WordWrap
         textFormat: Text.PlainText
-        text: "Only trust this certificate if your IT team confirms the fingerprint, or you are sure this is the right server. It will be trusted for "
-              + (root.certificatePrompt ? root.certificatePrompt.host : "") + " only."
+        text: "Ignoring errors accepts any certificate from "
+              + (root.certificatePrompt ? root.certificatePrompt.host : "this server")
+              + ", so the widget can no longer detect an impostor server, which would receive your password. Trusting only this certificate keeps that protection; compare the fingerprint below with IT."
         color: root.barForeground
         opacity: 0.8
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -751,6 +762,17 @@ Panel {
         font.pixelSize: Style.font.bodySmall
       }
 
+      Button {
+        visible: root.certificatePrompt !== null
+        enabled: !root.busy && !settingsProcess.running
+        text: "Ignore certificate errors for this server and connect"
+        foreground: root.barForeground
+        fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+        fontSize: Style.font.bodySmall
+        bordered: true
+        onClicked: root.ignoreCertificateAndConnect()
+      }
+
       Row {
         visible: root.certificatePrompt !== null
         spacing: Style.space(8)
@@ -758,7 +780,7 @@ Panel {
         Button {
           enabled: !root.busy && !settingsProcess.running
           text: root.certificatePrompt && root.certificatePrompt.changed
-                ? "Trust the NEW certificate and connect" : "Trust this certificate and connect"
+                ? "Trust only the NEW certificate" : "Trust only this certificate"
           foreground: root.barForeground
           fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
           fontSize: Style.font.bodySmall
@@ -777,9 +799,10 @@ Panel {
       }
 
       Button {
-        visible: root.dependenciesReady && root.certificatePinned && !root.connected && root.certificatePrompt === null
+        visible: root.dependenciesReady && (root.certificatePinned || root.certificateIgnored) && !root.connected && root.certificatePrompt === null
         enabled: !root.busy && !settingsProcess.running
-        text: "Using a trusted certificate for this server · Forget"
+        text: root.certificateIgnored ? "Ignoring certificate errors for this server · Stop ignoring"
+                                      : "Using a trusted certificate for this server · Forget"
         foreground: root.barForeground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
         fontSize: Style.font.bodySmall

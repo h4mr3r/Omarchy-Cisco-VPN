@@ -111,7 +111,15 @@ supported. A successful login depends on your gateway's authentication policy.
 Certificate validation is never switched off. If the gateway's certificate
 isn't trusted by this computer (for example, it is signed by a company CA that
 isn't installed), the popup shows the reason and the certificate's
-`pin-sha256:` fingerprint, with **Trust this certificate and connect**. Trusting
+`pin-sha256:` fingerprint, with two choices.
+
+**Ignore certificate errors for this server and connect** accepts whatever
+certificate that server (host and port) presents from then on. The widget can
+then no longer tell an impostor from your real gateway. Someone who intercepts
+your network could pose as the VPN and receive your password. Use it only on
+networks you trust. **Stop ignoring** under the form turns it off.
+
+**Trust only this certificate** is the safer choice. Trusting
 pins that exact certificate for that server and port only (OpenConnect
 `--servercert`). The pin is saved in `~/.local/state/omarchy/settings/cisco-vpn.json`.
 Any other certificate, including one an attacker presents, is still refused.

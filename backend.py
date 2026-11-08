@@ -33,7 +33,7 @@ FORWARDER_URL = "http://127.0.0.1:3128"
 PROXY_ENV_NAMES = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
 NO_PROXY_VALUE = "localhost,127.0.0.1,::1"
 SETTINGS_DEFAULTS = {"corporateProxy": "", "proxyLogin": "", "useVpnPassword": True,
-                     "appsProxy": False, "trustedCertificates": {}}
+                     "appsProxy": False, "trustedCertificates": {}, "ignoreCertificates": []}
 FINGERPRINT = re.compile(r"^(?:pin-sha256:[A-Za-z0-9+/]{43}=|sha256:[0-9a-fA-F]{64}|sha1:[0-9a-fA-F]{40})$")
 # Printed by openconnect for an untrusted certificate ("--servercert pin-sha256:...")
 # and for a pinned one that no longer matches ("...match server's certificate: pin-sha256:...").
@@ -220,7 +220,8 @@ def state():
     uuid = profile_uuid()
     if not uuid:
         return {"connected": False, "server": "", "username": "", "proxy": "",
-                "certificatePinned": False, "settings": load_settings()}
+                "certificatePinned": False, "certificateIgnored": False,
+                "settings": load_settings()}
     vpn = profile_settings(uuid).get("vpn")
     if vpn is None:
         raise VpnError("NetworkManager could not read the VPN profile")
@@ -232,7 +233,15 @@ def state():
         "username": vpn.get("user-name", ""),
         "proxy": data.get("proxy", ""),
         "certificatePinned": pinned_for(data.get("gateway", "")),
+        "certificateIgnored": ignored_for(data.get("gateway", "")),
     }
+
+
+def ignored_for(address):
+    try:
+        return bool(address) and ignores_certificate(address)
+    except VpnError:
+        return False
 
 
 def pinned_for(address):
@@ -332,6 +341,8 @@ def load_settings():
         host: pin for host, pin in settings["trustedCertificates"].items()
         if isinstance(host, str) and isinstance(pin, str) and FINGERPRINT.fullmatch(pin)
     }
+    settings["ignoreCertificates"] = [
+        host for host in settings["ignoreCertificates"] if isinstance(host, str)]
     return settings
 
 
@@ -359,6 +370,8 @@ def save_settings(changes):
         settings["appsProxy"] = changes["appsProxy"] is True
     if "trustedCertificates" in changes:
         settings["trustedCertificates"] = changes["trustedCertificates"]
+    if "ignoreCertificates" in changes:
+        settings["ignoreCertificates"] = changes["ignoreCertificates"]
     write_private(settings_path(), json.dumps(settings, indent=2) + "\n")
     return settings
 
@@ -445,10 +458,36 @@ def trust_certificate(request):
     return save_settings({"trustedCertificates": pins})
 
 
+def ignores_certificate(address):
+    return certificate_host(address) in load_settings().get("ignoreCertificates", [])
+
+
+def ignore_certificate(request):
+    """Accept any certificate from this one server (no impersonation protection)."""
+    host = certificate_host(str(request.get("server", "")))
+    hosts = [h for h in load_settings()["ignoreCertificates"] if h != host] + [host]
+    return save_settings({"ignoreCertificates": hosts})
+
+
 def forget_certificate(request):
-    pins = dict(load_settings()["trustedCertificates"])
-    pins.pop(certificate_host(str(request.get("server", ""))), None)
-    return save_settings({"trustedCertificates": pins})
+    host = certificate_host(str(request.get("server", "")))
+    settings = load_settings()
+    pins = dict(settings["trustedCertificates"])
+    pins.pop(host, None)
+    hosts = [h for h in settings["ignoreCertificates"] if h != host]
+    return save_settings({"trustedCertificates": pins, "ignoreCertificates": hosts})
+
+
+def authenticate_server(address, username, password, proxy):
+    """Authenticate with the saved certificate policy for this server."""
+    if ignores_certificate(address):
+        try:
+            return authenticate(address, username, password, proxy)
+        except CertificateUntrusted as untrusted:
+            # Ignore mode: accept whatever certificate the server presented.
+            return authenticate(address, username, password, proxy,
+                                untrusted.details["fingerprint"])
+    return authenticate(address, username, password, proxy, trusted_certificate(address))
 
 
 def certificate_failure(stderr, address):
@@ -678,16 +717,20 @@ def read_request():
 
 def main():
     actions = ("status", "connect", "disconnect", "proxy-check", "save-settings",
-               "apps-proxy-on", "apps-proxy-off", "trust-certificate", "forget-certificate")
+               "apps-proxy-on", "apps-proxy-off", "trust-certificate", "ignore-certificate",
+               "forget-certificate")
     if len(sys.argv) != 2 or sys.argv[1] not in actions:
         raise VpnError("Expected one of: " + ", ".join(actions))
     action = sys.argv[1]
     if action == "save-settings":
         request = read_request()
-        request.pop("trustedCertificates", None)  # only via trust/forget-certificate
+        request.pop("trustedCertificates", None)  # only via the certificate actions
+        request.pop("ignoreCertificates", None)
         return {"settings": save_settings(request)}
     if action == "trust-certificate":
         return {"settings": trust_certificate(read_request())}
+    if action == "ignore-certificate":
+        return {"settings": ignore_certificate(read_request())}
     if action == "forget-certificate":
         return {"settings": forget_certificate(read_request())}
     if action in ("apps-proxy-on", "apps-proxy-off"):
@@ -705,8 +748,7 @@ def main():
         proxy = resolve_proxy(request.get("proxyMode", "off"), request.get("proxyUrl", ""))
         uuid = ensure_profile(address, username, proxy)
         check_cancelled()
-        activate(uuid, authenticate(address, username, password, proxy,
-                                    trusted_certificate(address)))
+        activate(uuid, authenticate_server(address, username, password, proxy))
     elif action == "disconnect":
         uuid = profile_uuid()
         if not uuid:

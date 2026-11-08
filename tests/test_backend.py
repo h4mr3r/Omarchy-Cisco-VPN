@@ -51,6 +51,7 @@ class BackendTest(unittest.TestCase):
             self.assertEqual(backend.state(), {
                 "connected": True, "server": "https://vpn.example.com", "username": "name",
                 "proxy": "http://proxy.example.com:8080", "settings": {}, "certificatePinned": False,
+                "certificateIgnored": False,
             })
         client.assert_not_called()
 
@@ -403,6 +404,27 @@ class BackendTest(unittest.TestCase):
             settings = backend.main()["settings"]
         self.assertEqual(settings["trustedCertificates"], {})
         self.assertEqual(settings["proxyLogin"], "me")
+
+    def test_ignore_mode_retries_with_presented_certificate(self):
+        import tempfile
+        untrusted = subprocess.CompletedProcess([], 1, "", self.UNTRUSTED_STDERR)
+        ok = subprocess.CompletedProcess(
+            [], 0, "COOKIE='c'\nCONNECT_URL='https://vpn.example.com'\nFINGERPRINT='f'\n", "")
+        with tempfile.TemporaryDirectory() as home, patch.dict(
+                backend.os.environ, {"XDG_STATE_HOME": home}):
+            with patch.object(backend, "run", return_value=untrusted), self.assertRaises(
+                    backend.CertificateUntrusted):
+                backend.authenticate_server("https://vpn.example.com", "name", "pw", "")
+            backend.ignore_certificate({"server": "vpn.example.com"})
+            self.assertTrue(backend.ignored_for("https://vpn.example.com"))
+            self.assertFalse(backend.ignored_for("https://other.example.com"))
+            with patch.object(backend, "run", side_effect=[untrusted, ok]) as runner:
+                values = backend.authenticate_server("https://vpn.example.com", "name", "pw", "")
+            self.assertEqual(values["COOKIE"], "c")
+            retry = runner.call_args_list[1].args[0]
+            self.assertEqual(retry[retry.index("--servercert") + 1], self.PIN)
+            backend.forget_certificate({"server": "vpn.example.com"})
+            self.assertFalse(backend.ignored_for("https://vpn.example.com"))
 
 
 if __name__ == "__main__":
