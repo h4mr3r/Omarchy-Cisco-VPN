@@ -50,7 +50,7 @@ class BackendTest(unittest.TestCase):
                 backend.NM.Client, "new") as client:
             self.assertEqual(backend.state(), {
                 "connected": True, "server": "https://vpn.example.com", "username": "name",
-                "proxy": "http://proxy.example.com:8080", "settings": {},
+                "proxy": "http://proxy.example.com:8080", "settings": {}, "certificatePinned": False,
             })
         client.assert_not_called()
 
@@ -338,6 +338,71 @@ class BackendTest(unittest.TestCase):
         self.assertEqual(backend.environment_proxy(
             {"https_proxy": "http://127.0.0.1:3128", "http_proxy": "http://gw-proxy:8080"}),
             "http://gw-proxy:8080")
+
+    PIN = "pin-sha256:9SLklscvzMYj8f+52lp5ze/hY0CFHyLSPQzSpYYIBm8="
+    UNTRUSTED_STDERR = (
+        'Certificate from VPN server "vpn.example.com" failed verification.\n'
+        "Reason: signer not found\n"
+        "To trust this server in future, perhaps add this to your command line:\n"
+        "    --servercert pin-sha256:9SLklscvzMYj8f+52lp5ze/hY0CFHyLSPQzSpYYIBm8=\n"
+        "SSL connection failure: Error in the certificate.\n")
+
+    def test_untrusted_certificate_is_offered_for_pinning(self):
+        with patch.object(backend, "run",
+                          return_value=subprocess.CompletedProcess([], 1, "", self.UNTRUSTED_STDERR)):
+            with self.assertRaises(backend.CertificateUntrusted) as raised:
+                backend.authenticate("https://VPN.example.com", "name", "private-password")
+        self.assertEqual(raised.exception.details, {
+            "host": "vpn.example.com:443", "fingerprint": self.PIN,
+            "reason": "signer not found", "changed": False})
+        self.assertIn("signer not found", str(raised.exception))
+        self.assertNotIn("private-password", repr(raised.exception.details))
+
+    def test_changed_pinned_certificate_warns(self):
+        stderr = ("None of the 1 fingerprint(s) specified via --servercert match server's "
+                  f"certificate: {self.PIN}\n")
+        error = backend.certificate_failure(stderr, "https://vpn.example.com:8443")
+        self.assertTrue(error.details["changed"])
+        self.assertEqual(error.details["host"], "vpn.example.com:8443")
+        self.assertIn("CHANGED", str(error))
+
+    def test_pinned_certificate_is_passed_to_openconnect(self):
+        text = "COOKIE='c'\nCONNECT_URL='https://vpn.example.com'\nFINGERPRINT='f'\n"
+        with patch.object(backend, "run",
+                          return_value=subprocess.CompletedProcess([], 0, text, "")) as runner:
+            backend.authenticate("https://vpn.example.com", "name", "pw", servercert=self.PIN)
+        argv = runner.call_args.args[0]
+        self.assertEqual(argv[argv.index("--servercert") + 1], self.PIN)
+
+    def test_accepted_pin_does_not_blame_certificate(self):
+        stderr = ("Server certificate verify failed: signer not found\n"
+                  "Connected to HTTPS on vpn.example.com with ciphersuite (TLS1.3)\n"
+                  "Login failed.\n")
+        self.assertIn("rejected the credentials", backend.authentication_error(stderr))
+
+    def test_trust_and_forget_certificate_per_host(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as home, patch.dict(
+                backend.os.environ, {"XDG_STATE_HOME": home}):
+            backend.trust_certificate({"server": "vpn.example.com/group", "fingerprint": self.PIN})
+            self.assertEqual(backend.trusted_certificate("https://VPN.example.com"), self.PIN)
+            self.assertEqual(backend.trusted_certificate("https://vpn.example.com:8443"), "")
+            self.assertEqual(backend.trusted_certificate("https://other.example.com"), "")
+            with self.assertRaisesRegex(backend.VpnError, "Invalid certificate"):
+                backend.trust_certificate({"server": "vpn.example.com", "fingerprint": "nope"})
+            backend.forget_certificate({"server": "vpn.example.com"})
+            self.assertEqual(backend.trusted_certificate("https://vpn.example.com"), "")
+
+    def test_generic_save_settings_cannot_set_trusted_certificates(self):
+        import tempfile
+        request = {"trustedCertificates": {"evil.example.com:443": self.PIN}, "proxyLogin": "me"}
+        with tempfile.TemporaryDirectory() as home, patch.dict(
+                backend.os.environ, {"XDG_STATE_HOME": home}), patch.object(
+                sys, "argv", ["backend.py", "save-settings"]), patch.object(
+                sys, "stdin", io.StringIO(json.dumps(request) + "\n")):
+            settings = backend.main()["settings"]
+        self.assertEqual(settings["trustedCertificates"], {})
+        self.assertEqual(settings["proxyLogin"], "me")
 
 
 if __name__ == "__main__":

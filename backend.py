@@ -33,7 +33,12 @@ FORWARDER_URL = "http://127.0.0.1:3128"
 PROXY_ENV_NAMES = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
 NO_PROXY_VALUE = "localhost,127.0.0.1,::1"
 SETTINGS_DEFAULTS = {"corporateProxy": "", "proxyLogin": "", "useVpnPassword": True,
-                     "appsProxy": False}
+                     "appsProxy": False, "trustedCertificates": {}}
+FINGERPRINT = re.compile(r"^(?:pin-sha256:[A-Za-z0-9+/]{43}=|sha256:[0-9a-fA-F]{64}|sha1:[0-9a-fA-F]{40})$")
+# Printed by openconnect for an untrusted certificate ("--servercert pin-sha256:...")
+# and for a pinned one that no longer matches ("...match server's certificate: pin-sha256:...").
+SERVERCERT_HINT = re.compile(r"(?:--servercert[ =]+|match server's certificate:\s*)"
+                             r"((?:pin-sha256|sha256|sha1):[A-Za-z0-9+/=]+)")
 NM_BUS = "org.freedesktop.NetworkManager"
 NM_SETTINGS = "/org/freedesktop/NetworkManager/Settings"
 
@@ -44,6 +49,15 @@ class VpnError(Exception):
 
 class VpnCancelled(VpnError):
     pass
+
+
+class CertificateUntrusted(VpnError):
+    """The gateway's certificate failed verification; carries what the UI may pin."""
+
+    def __init__(self, message, host, fingerprint, reason, changed):
+        super().__init__(message)
+        self.details = {"host": host, "fingerprint": fingerprint, "reason": reason,
+                        "changed": changed}
 
 
 active_child = None
@@ -206,7 +220,7 @@ def state():
     uuid = profile_uuid()
     if not uuid:
         return {"connected": False, "server": "", "username": "", "proxy": "",
-                "settings": load_settings()}
+                "certificatePinned": False, "settings": load_settings()}
     vpn = profile_settings(uuid).get("vpn")
     if vpn is None:
         raise VpnError("NetworkManager could not read the VPN profile")
@@ -217,7 +231,15 @@ def state():
         "server": data.get("gateway", ""),
         "username": vpn.get("user-name", ""),
         "proxy": data.get("proxy", ""),
+        "certificatePinned": pinned_for(data.get("gateway", "")),
     }
+
+
+def pinned_for(address):
+    try:
+        return bool(address) and bool(trusted_certificate(address))
+    except VpnError:
+        return False
 
 
 def server_url(value):
@@ -306,6 +328,10 @@ def load_settings():
         for key, default in SETTINGS_DEFAULTS.items():
             if isinstance(stored.get(key), type(default)):
                 settings[key] = stored[key]
+    settings["trustedCertificates"] = {
+        host: pin for host, pin in settings["trustedCertificates"].items()
+        if isinstance(host, str) and isinstance(pin, str) and FINGERPRINT.fullmatch(pin)
+    }
     return settings
 
 
@@ -331,6 +357,8 @@ def save_settings(changes):
         settings["useVpnPassword"] = changes["useVpnPassword"] is True
     if "appsProxy" in changes:
         settings["appsProxy"] = changes["appsProxy"] is True
+    if "trustedCertificates" in changes:
+        settings["trustedCertificates"] = changes["trustedCertificates"]
     write_private(settings_path(), json.dumps(settings, indent=2) + "\n")
     return settings
 
@@ -397,6 +425,53 @@ def ensure_profile(address, username, proxy):
     return uuid
 
 
+def certificate_host(address):
+    """Key for a pinned certificate: lowercase host and port of the gateway."""
+    parsed = urlsplit(server_url(address))
+    return f"{parsed.hostname.lower()}:{parsed.port or 443}"
+
+
+def trusted_certificate(address):
+    return load_settings().get("trustedCertificates", {}).get(certificate_host(address), "")
+
+
+def trust_certificate(request):
+    host = certificate_host(str(request.get("server", "")))
+    fingerprint = str(request.get("fingerprint", ""))
+    if not FINGERPRINT.fullmatch(fingerprint):
+        raise VpnError("Invalid certificate fingerprint")
+    pins = dict(load_settings()["trustedCertificates"])
+    pins[host] = fingerprint
+    return save_settings({"trustedCertificates": pins})
+
+
+def forget_certificate(request):
+    pins = dict(load_settings()["trustedCertificates"])
+    pins.pop(certificate_host(str(request.get("server", ""))), None)
+    return save_settings({"trustedCertificates": pins})
+
+
+def certificate_failure(stderr, address):
+    """Return CertificateUntrusted when stderr shows a pinnable verification failure."""
+    match = SERVERCERT_HINT.search(stderr)
+    if not match or not FINGERPRINT.fullmatch(match.group(1)):
+        return None
+    reason = ""
+    reason_match = re.search(r"^Reason:\s*(.{1,200})$", stderr, re.MULTILINE)
+    if reason_match:
+        reason = re.sub(r"[^\w .,:;()'/-]", "", reason_match.group(1)).strip()
+    changed = "none of the" in stderr.lower() and "--servercert" in stderr.lower()
+    if changed:
+        message = ("WARNING: the VPN server's certificate CHANGED since you trusted it. "
+                   "This can mean someone is intercepting the connection; ask your IT team "
+                   "before trusting the new one")
+    else:
+        message = "The VPN server's certificate is not trusted by this computer"
+        if reason:
+            message += f" ({reason})"
+    return CertificateUntrusted(message, certificate_host(address), match.group(1), reason, changed)
+
+
 def authentication_error(stderr):
     details = stderr.lower()
     if "proxy" in details:
@@ -405,7 +480,11 @@ def authentication_error(stderr):
         if any(term in details for term in ("407", "authentication", "basic")):
             return "The proxy requires a login, which is not supported for reaching the VPN server"
         return "Could not connect through the proxy; check the proxy address"
-    if any(term in details for term in ("certificate", "servercert", "issuer", "trust anchor")):
+    # With a pinned certificate openconnect still logs "Server certificate verify
+    # failed" before accepting the pin, so only blame the certificate when the
+    # TLS connection never came up.
+    tls_up = "connected to https" in details
+    if not tls_up and any(term in details for term in ("certificate", "servercert", "issuer", "trust anchor")):
         return "VPN server certificate could not be verified; check with your IT team"
     if any(term in details for term in ("resolve", "getaddrinfo", "name or service not known")):
         return "VPN server name could not be resolved"
@@ -418,14 +497,19 @@ def authentication_error(stderr):
     return "OpenConnect authentication failed; the gateway may require another login step"
 
 
-def authenticate(address, username, password, proxy=""):
+def authenticate(address, username, password, proxy="", servercert=""):
     proxy_args = ["--proxy", proxy] if proxy else ["--no-proxy"]
+    # --servercert accepts only this exact certificate (it implies --no-system-trust).
+    cert_args = ["--servercert", servercert] if servercert else []
     result = run(
-        ["openconnect", "--protocol=anyconnect", "--authenticate", *proxy_args,
+        ["openconnect", "--protocol=anyconnect", "--authenticate", *proxy_args, *cert_args,
          "--non-inter", "--passwd-on-stdin", "--user", username, address],
         input=password + "\n", timeout=90,
     )
     if result.returncode:
+        untrusted = certificate_failure(result.stderr, address)
+        if untrusted is not None:
+            raise untrusted
         raise VpnError(authentication_error(result.stderr))
 
     values = {}
@@ -594,12 +678,18 @@ def read_request():
 
 def main():
     actions = ("status", "connect", "disconnect", "proxy-check", "save-settings",
-               "apps-proxy-on", "apps-proxy-off")
+               "apps-proxy-on", "apps-proxy-off", "trust-certificate", "forget-certificate")
     if len(sys.argv) != 2 or sys.argv[1] not in actions:
         raise VpnError("Expected one of: " + ", ".join(actions))
     action = sys.argv[1]
     if action == "save-settings":
-        return {"settings": save_settings(read_request())}
+        request = read_request()
+        request.pop("trustedCertificates", None)  # only via trust/forget-certificate
+        return {"settings": save_settings(request)}
+    if action == "trust-certificate":
+        return {"settings": trust_certificate(read_request())}
+    if action == "forget-certificate":
+        return {"settings": forget_certificate(read_request())}
     if action in ("apps-proxy-on", "apps-proxy-off"):
         return {"settings": set_apps_proxy(action == "apps-proxy-on")}
     if action == "proxy-check":
@@ -615,7 +705,8 @@ def main():
         proxy = resolve_proxy(request.get("proxyMode", "off"), request.get("proxyUrl", ""))
         uuid = ensure_profile(address, username, proxy)
         check_cancelled()
-        activate(uuid, authenticate(address, username, password, proxy))
+        activate(uuid, authenticate(address, username, password, proxy,
+                                    trusted_certificate(address)))
     elif action == "disconnect":
         uuid = profile_uuid()
         if not uuid:
@@ -631,6 +722,9 @@ if __name__ == "__main__":
         # NetworkManager's message names the failing step; it carries no secrets.
         print(json.dumps({"ok": False,
                           "error": f"NetworkManager rejected the VPN operation: {error.message}"}))
+        sys.exit(1)
+    except CertificateUntrusted as error:
+        print(json.dumps({"ok": False, "error": str(error), "certificate": error.details}))
         sys.exit(1)
     except (VpnError, ValueError, KeyError, TypeError) as error:
         print(json.dumps({"ok": False, "error": str(error)}))

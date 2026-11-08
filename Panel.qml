@@ -37,6 +37,13 @@ Panel {
   property string forwarderQueued: ""
   property string pendingProxyPassword: ""
   property string settingsRequest: ""
+  property string afterSettings: ""
+  // Untrusted gateway certificate offered for pinning; the request (with the
+  // password) is kept only while this prompt is shown so "Trust and connect"
+  // can retry without retyping.
+  property var certificatePrompt: null
+  property string lastConnectRequest: ""
+  property bool certificatePinned: false
   readonly property bool forwarderWanted: dependenciesReady && (appsProxy || connected)
   readonly property string forwarderHelper: Qt.resolvedUrl("proxy_forwarder.py").toString().replace(/^file:\/\//, "")
   property bool dependenciesKnown: false
@@ -71,9 +78,11 @@ Panel {
       var data = JSON.parse(text)
       if (!data.ok || exitCode !== 0) {
         if (showError) errorText = data.error || "VPN operation failed"
+        if (showError && data.certificate && data.certificate.fingerprint) certificatePrompt = data.certificate
         return
       }
       connected = data.connected === true
+      certificatePinned = data.certificatePinned === true
       if (data.settings && (!opened || !settingsLoaded)) applySettings(data.settings)
       if (showError && data.connected === true) {
         serverDirty = false
@@ -190,21 +199,47 @@ Panel {
       errorText = "Enter a proxy address or set Proxy to Off"
       return
     }
-    request = JSON.stringify({
+    startConnect(JSON.stringify({
       server: serverField.text.trim(),
       username: userField.text.trim(),
       password: passwordField.text,
       proxyMode: proxyMode,
       proxyUrl: proxyField.text.trim()
-    })
+    }))
+    passwordField.text = ""
+  }
+
+  function startConnect(payload) {
+    request = payload
+    lastConnectRequest = payload
+    certificatePrompt = null
     busy = true
     cancelRequested = false
     action = "connect"
     errorText = ""
-    pendingProxyPassword = (useVpnPassword && corporateProxy !== "") ? passwordField.text : ""
+    var password = JSON.parse(payload).password
+    pendingProxyPassword = (useVpnPassword && corporateProxy !== "") ? password : ""
     actionProcess.command = ["python", helper, "connect"]
     actionProcess.running = true
-    passwordField.text = ""
+  }
+
+  function trustCertificateAndConnect() {
+    if (busy || !certificatePrompt || settingsProcess.running) return
+    var server = JSON.parse(lastConnectRequest).server
+    afterSettings = "connect"
+    runSettings("trust-certificate", { server: server, fingerprint: certificatePrompt.fingerprint })
+  }
+
+  function dismissCertificate() {
+    certificatePrompt = null
+    lastConnectRequest = ""
+    errorText = ""
+  }
+
+  function forgetCertificate() {
+    if (busy) return
+    runSettings("forget-certificate", { server: serverField.text.trim() })
+    certificatePinned = false
   }
 
   function disconnectVpn() {
@@ -253,6 +288,8 @@ Panel {
     passwordField.text = ""
     proxyPasswordField.text = ""
     proxyCheckText = ""
+    certificatePrompt = null
+    lastConnectRequest = ""
   }
 
   Timer {
@@ -336,6 +373,8 @@ Panel {
       else root.applyResult(actionOutput.text, code, true)
       root.cancelRequested = false
       if (!root.connected) root.pendingProxyPassword = ""
+      // Keep the request only while a certificate decision is pending.
+      if (!root.certificatePrompt) root.lastConnectRequest = ""
       root.refresh()
     }
   }
@@ -400,10 +439,17 @@ Panel {
       waitForEnd: true
     }
     onExited: function(code) {
+      var next = root.afterSettings
+      root.afterSettings = ""
       try {
         var data = JSON.parse(settingsOutput.text)
         if (data.settings) root.applySettings(data.settings)
-        if (code !== 0 || !data.ok) root.forwarderError = data.error || "Could not save proxy settings"
+        if (code !== 0 || !data.ok) {
+          if (next === "connect") root.errorText = data.error || "Could not save the trusted certificate"
+          else root.forwarderError = data.error || "Could not save proxy settings"
+        } else if (next === "connect" && root.lastConnectRequest !== "") {
+          root.startConnect(root.lastConnectRequest)
+        }
       } catch (error) {
         root.forwarderError = "VPN helper returned an invalid response"
       }
@@ -676,6 +722,69 @@ Panel {
         color: root.bar ? root.bar.urgent : Color.urgent
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
         font.pixelSize: Style.font.bodySmall
+      }
+
+      Text {
+        visible: root.certificatePrompt !== null
+        width: parent.width
+        wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
+        text: "Only trust this certificate if your IT team confirms the fingerprint, or you are sure this is the right server. It will be trusted for "
+              + (root.certificatePrompt ? root.certificatePrompt.host : "") + " only."
+        color: root.barForeground
+        opacity: 0.8
+        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+        font.pixelSize: Style.font.bodySmall
+      }
+
+      TextEdit {
+        // Selectable so the fingerprint can be copied and compared with IT.
+        visible: root.certificatePrompt !== null
+        width: parent.width
+        readOnly: true
+        selectByMouse: true
+        wrapMode: TextEdit.WrapAnywhere
+        textFormat: TextEdit.PlainText
+        text: root.certificatePrompt ? root.certificatePrompt.fingerprint : ""
+        color: root.barForeground
+        font.family: "monospace"
+        font.pixelSize: Style.font.bodySmall
+      }
+
+      Row {
+        visible: root.certificatePrompt !== null
+        spacing: Style.space(8)
+
+        Button {
+          enabled: !root.busy && !settingsProcess.running
+          text: root.certificatePrompt && root.certificatePrompt.changed
+                ? "Trust the NEW certificate and connect" : "Trust this certificate and connect"
+          foreground: root.barForeground
+          fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+          fontSize: Style.font.bodySmall
+          bordered: true
+          onClicked: root.trustCertificateAndConnect()
+        }
+
+        Button {
+          enabled: !root.busy
+          text: "Don't trust"
+          foreground: root.barForeground
+          fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+          fontSize: Style.font.bodySmall
+          onClicked: root.dismissCertificate()
+        }
+      }
+
+      Button {
+        visible: root.dependenciesReady && root.certificatePinned && !root.connected && root.certificatePrompt === null
+        enabled: !root.busy && !settingsProcess.running
+        text: "Using a trusted certificate for this server · Forget"
+        foreground: root.barForeground
+        fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+        fontSize: Style.font.bodySmall
+        leftAlign: true
+        onClicked: root.forgetCertificate()
       }
 
       Rectangle {

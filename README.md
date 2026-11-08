@@ -103,9 +103,21 @@ your VPN server details, credentials, NetworkManager profile, or logs to this
 repository.
 
 This initial release supports a single Cisco AnyConnect username/password
-flow. VPN groups, OTP/MFA prompts, browser SSO, client certificates, and
-custom certificate trust are not supported. Certificate validation is never
-disabled. A successful login depends on your gateway's authentication policy.
+flow. VPN groups, OTP/MFA prompts, browser SSO and client certificates are not
+supported. A successful login depends on your gateway's authentication policy.
+
+## Untrusted server certificates
+
+Certificate validation is never switched off. If the gateway's certificate
+isn't trusted by this computer (for example, it is signed by a company CA that
+isn't installed), the popup shows the reason and the certificate's
+`pin-sha256:` fingerprint, with **Trust this certificate and connect**. Trusting
+pins that exact certificate for that server and port only (OpenConnect
+`--servercert`). The pin is saved in `~/.local/state/omarchy/settings/cisco-vpn.json`.
+Any other certificate, including one an attacker presents, is still refused.
+Only trust a fingerprint your IT team confirms. If the server's certificate
+later changes, the connection is refused with a warning. You can trust the new
+one after checking it. **Forget** under the form removes the pin.
 
 ## Development
 
