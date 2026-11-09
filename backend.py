@@ -33,7 +33,10 @@ FORWARDER_URL = "http://127.0.0.1:3128"
 PROXY_ENV_NAMES = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
 NO_PROXY_VALUE = "localhost,127.0.0.1,::1"
 SETTINGS_DEFAULTS = {"corporateProxy": "", "proxyLogin": "", "useVpnPassword": True,
-                     "appsProxy": False, "trustedCertificates": {}, "ignoreCertificates": []}
+                     "appsProxy": False, "trustedCertificates": {}, "ignoreCertificates": [],
+                     "versionString": "", "localHostname": ""}
+VERSION_STRING = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$")
+LOCAL_HOSTNAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 FINGERPRINT = re.compile(r"^(?:pin-sha256:[A-Za-z0-9+/]{43}=|sha256:[0-9a-fA-F]{64}|sha1:[0-9a-fA-F]{40})$")
 # Printed by openconnect for an untrusted certificate ("--servercert pin-sha256:...")
 # and for a pinned one that no longer matches ("...match server's certificate: pin-sha256:...").
@@ -355,8 +358,27 @@ def write_private(path, text):
     os.replace(temporary, path)
 
 
+def version_string(value):
+    value = str(value).strip()
+    if value and not VERSION_STRING.fullmatch(value):
+        raise VpnError("Client version may contain only letters, digits, '.', '_' and '-', "
+                       "for example 5.1.15.287")
+    return value
+
+
+def local_hostname(value):
+    value = str(value).strip()
+    if value and (not LOCAL_HOSTNAME.fullmatch(value) or ".." in value):
+        raise VpnError("Hostname may contain only letters, digits, '.' and '-'")
+    return value
+
+
 def save_settings(changes):
     settings = load_settings()
+    if "versionString" in changes:
+        settings["versionString"] = version_string(changes["versionString"])
+    if "localHostname" in changes:
+        settings["localHostname"] = local_hostname(changes["localHostname"])
     if "corporateProxy" in changes:
         settings["corporateProxy"] = corporate_proxy(str(changes["corporateProxy"]))
     if "proxyLogin" in changes:
@@ -479,15 +501,19 @@ def forget_certificate(request):
 
 
 def authenticate_server(address, username, password, proxy):
-    """Authenticate with the saved certificate policy for this server."""
+    """Authenticate with the saved certificate policy and client identity."""
+    settings = load_settings()
+    identity = {"version": settings.get("versionString", ""),
+                "hostname": settings.get("localHostname", "")}
     if ignores_certificate(address):
         try:
-            return authenticate(address, username, password, proxy)
+            return authenticate(address, username, password, proxy, **identity)
         except CertificateUntrusted as untrusted:
             # Ignore mode: accept whatever certificate the server presented.
             return authenticate(address, username, password, proxy,
-                                untrusted.details["fingerprint"])
-    return authenticate(address, username, password, proxy, trusted_certificate(address))
+                                untrusted.details["fingerprint"], **identity)
+    return authenticate(address, username, password, proxy, trusted_certificate(address),
+                        **identity)
 
 
 def certificate_failure(stderr, address):
@@ -530,19 +556,27 @@ def authentication_error(stderr):
     if any(term in details for term in ("failed to connect", "connection refused", "network is unreachable")):
         return "Could not reach the VPN server; check the address and network"
     if any(term in details for term in ("authgroup", "non-interactive", "form entry", "token", "challenge")):
-        return "VPN requires an additional sign-in step (group or token) not supported by this widget"
+        return ("VPN asked for more sign-in input. If your gateway requires a specific client "
+                "version or hostname, fill in Client version / Hostname; otherwise it needs a "
+                "group or token step this widget does not support")
     if any(term in details for term in ("login failed", "authentication failed", "invalid credentials", "incorrect password")):
         return "VPN rejected the credentials; check your username and password"
     return "OpenConnect authentication failed; the gateway may require another login step"
 
 
-def authenticate(address, username, password, proxy="", servercert=""):
+def authenticate(address, username, password, proxy="", servercert="", version="", hostname=""):
     proxy_args = ["--proxy", proxy] if proxy else ["--no-proxy"]
     # --servercert accepts only this exact certificate (it implies --no-system-trust).
     cert_args = ["--servercert", servercert] if servercert else []
+    # Some gateways only accept known AnyConnect client versions / hostnames.
+    identity_args = []
+    if version:
+        identity_args.append(f"--version-string={version_string(version)}")
+    if hostname:
+        identity_args.append(f"--local-hostname={local_hostname(hostname)}")
     result = run(
         ["openconnect", "--protocol=anyconnect", "--authenticate", *proxy_args, *cert_args,
-         "--non-inter", "--passwd-on-stdin", "--user", username, address],
+         *identity_args, "--non-inter", "--passwd-on-stdin", "--user", username, address],
         input=password + "\n", timeout=90,
     )
     if result.returncode:
@@ -746,6 +780,9 @@ def main():
                 or any(char in value for value in (username, password) for char in "\r\n")):
             raise VpnError("Enter a username and password")
         proxy = resolve_proxy(request.get("proxyMode", "off"), request.get("proxyUrl", ""))
+        identity = {key: request[key] for key in ("versionString", "localHostname") if key in request}
+        if identity:
+            save_settings(identity)  # validated; remembered for the next connect
         uuid = ensure_profile(address, username, proxy)
         check_cancelled()
         activate(uuid, authenticate_server(address, username, password, proxy))

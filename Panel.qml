@@ -20,6 +20,9 @@ Panel {
   property string proxyMode: "off"
   property string proxyUrl: ""
   property bool proxyDirty: false
+  property string versionString: ""
+  property string localHostname: ""
+  property bool identityDirty: false
   property bool proxyExpanded: false
   property bool proxyChecking: false
   property string proxyCheckText: ""
@@ -90,6 +93,7 @@ Panel {
         serverDirty = false
         usernameDirty = false
         proxyDirty = false
+        identityDirty = false
         errorText = ""
       }
       if (!opened) {
@@ -110,6 +114,10 @@ Panel {
     proxyLogin = settings.proxyLogin || ""
     useVpnPassword = settings.useVpnPassword !== false
     appsProxy = settings.appsProxy === true
+    if (!identityDirty) {
+      versionString = settings.versionString || ""
+      localHostname = settings.localHostname || ""
+    }
     settingsLoaded = true
     syncForwarder()
   }
@@ -206,7 +214,9 @@ Panel {
       username: userField.text.trim(),
       password: passwordField.text,
       proxyMode: proxyMode,
-      proxyUrl: proxyField.text.trim()
+      proxyUrl: proxyField.text.trim(),
+      versionString: versionField.text.trim(),
+      localHostname: hostnameField.text.trim()
     }))
     passwordField.text = ""
   }
@@ -566,6 +576,34 @@ Panel {
         placeholderText: "Password"
         password: true
         enabled: !root.busy && !root.connected
+        onAccepted: root.connectVpn()
+      }
+
+      TextField {
+        id: versionField
+        visible: root.dependenciesReady && !root.connected
+        width: parent.width
+        placeholderText: "Client version (optional, e.g. 5.1.15.287)"
+        text: root.versionString
+        enabled: !root.busy
+        onTextChanged: {
+          if (root.opened) root.identityDirty = true
+          root.versionString = text
+        }
+        onAccepted: hostnameField.forceActiveFocus()
+      }
+
+      TextField {
+        id: hostnameField
+        visible: root.dependenciesReady && !root.connected
+        width: parent.width
+        placeholderText: "Hostname reported to VPN (optional)"
+        text: root.localHostname
+        enabled: !root.busy
+        onTextChanged: {
+          if (root.opened) root.identityDirty = true
+          root.localHostname = text
+        }
         onAccepted: root.connectVpn()
       }
 

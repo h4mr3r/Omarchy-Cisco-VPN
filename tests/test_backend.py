@@ -226,7 +226,7 @@ class BackendTest(unittest.TestCase):
             ("Failed to connect to vpn.example.com: Connection refused", "Could not reach"),
             ("Failed to resolve host vpn.example.com", "name could not be resolved"),
             ("Authentication failed: wrong password for user name", "rejected the credentials"),
-            ("Authentication requires form entry: token for user name", "additional sign-in step"),
+            ("Authentication requires form entry: token for user name", "more sign-in input"),
         )
         for stderr, expected in cases:
             with self.subTest(stderr=stderr):
@@ -425,6 +425,48 @@ class BackendTest(unittest.TestCase):
             self.assertEqual(retry[retry.index("--servercert") + 1], self.PIN)
             backend.forget_certificate({"server": "vpn.example.com"})
             self.assertFalse(backend.ignored_for("https://vpn.example.com"))
+
+    def test_client_identity_is_passed_to_openconnect(self):
+        text = "COOKIE='c'\nCONNECT_URL='https://vpn.example.com'\nFINGERPRINT='f'\n"
+        with patch.object(backend, "run",
+                          return_value=subprocess.CompletedProcess([], 0, text, "")) as runner:
+            backend.authenticate("https://vpn.example.com", "name", "pw",
+                                 version="5.1.15.287", hostname="my-laptop.corp")
+        argv = runner.call_args.args[0]
+        self.assertIn("--version-string=5.1.15.287", argv)
+        self.assertIn("--local-hostname=my-laptop.corp", argv)
+        self.assertLess(argv.index("--version-string=5.1.15.287"), argv.index("--user"))
+        with patch.object(backend, "run",
+                          return_value=subprocess.CompletedProcess([], 0, text, "")) as runner:
+            backend.authenticate("https://vpn.example.com", "name", "pw")
+        self.assertFalse(any(arg.startswith(("--version-string", "--local-hostname"))
+                             for arg in runner.call_args.args[0]))
+
+    def test_client_identity_validation(self):
+        self.assertEqual(backend.version_string(" 5.1.15.287 "), "5.1.15.287")
+        self.assertEqual(backend.local_hostname("hostname"), "hostname")
+        for value in ("5.1 beta", "--os=win", "5;rm", "x" * 65):
+            with self.subTest(value=value), self.assertRaises(backend.VpnError):
+                backend.version_string(value)
+        for value in ("-host", "host name", "host..corp", "host_name", "host.", "a" * 254):
+            with self.subTest(value=value), self.assertRaises(backend.VpnError):
+                backend.local_hostname(value)
+
+    def test_connect_saves_identity_and_uses_it(self):
+        import tempfile
+        request = {"server": "vpn.example.com", "username": "name", "password": "secret",
+                   "versionString": "5.1.15.287", "localHostname": "hostname"}
+        with tempfile.TemporaryDirectory() as home, patch.dict(
+                backend.os.environ, {"XDG_STATE_HOME": home}), patch.object(
+                sys, "argv", ["backend.py", "connect"]), patch.object(
+                sys, "stdin", io.StringIO(json.dumps(request) + "\n")), patch.object(
+                backend, "ensure_profile", return_value="uuid"), patch.object(
+                backend, "authenticate", return_value={"COOKIE": "c"}) as auth, patch.object(
+                backend, "activate"), patch.object(backend, "state", return_value={}):
+            backend.main()
+            self.assertEqual(auth.call_args.kwargs, {"version": "5.1.15.287", "hostname": "hostname"})
+            saved = backend.load_settings()
+        self.assertEqual((saved["versionString"], saved["localHostname"]), ("5.1.15.287", "hostname"))
 
 
 if __name__ == "__main__":
