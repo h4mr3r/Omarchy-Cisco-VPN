@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Local Cisco VPN bridge: OpenConnect authentication, NetworkManager tunnel."""
+"""Local Cisco VPN bridge: OpenConnect login as the user, tunnel via a root helper.
+
+The login (openconnect --authenticate) runs as the user. The tunnel itself is
+started by the root-owned tunnel helper (tunnel-helper.py, run through pkexec):
+openconnect with the stock vpnc-script, so routes and DNS behave exactly like
+running openconnect in a terminal.
+"""
 
 import collections
+import ipaddress
 import json
 import os
-import pwd
 import re
 import selectors
 import shlex
@@ -16,17 +22,17 @@ import time
 import urllib.request
 from urllib.parse import urlsplit
 
-import gi
 
-gi.require_version("NM", "1.0")
-from gi.repository import Gio, GLib, NM
-
-
-PROFILE = "Omarchy Cisco VPN"
-SERVICE = "org.freedesktop.NetworkManager.openconnect"
-UUID = re.compile(r"^[0-9a-fA-F-]{36}$")
+PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+# Root-owned copy of tunnel-helper.py, installed once by install-helper.sh.
+TUNNEL_HELPER = "/usr/local/libexec/omarchy-cisco-vpn-tunnel"
+TUNNEL_HELPER_SOURCE = os.path.join(PLUGIN_DIR, "tunnel-helper.py")
+TUNNEL_RUN_DIR = "/run/omarchy-cisco-vpn"
 MAX_OUTPUT_BYTES = 1024 * 1024
 MAX_PAC_BYTES = 1024 * 1024
+# Empty answers sent to extra prompts after the password (some gateways show a
+# form that only needs Enter). EOF after these makes openconnect give up.
+BLANK_RESPONSES = 3
 PROXY_SCHEMES = ("http", "socks", "socks5")
 HOST_PORT = re.compile(r"^\[?[A-Za-z0-9.:\-]+\]?:\d{1,5}$")
 FORWARDER_URL = "http://127.0.0.1:3128"
@@ -34,7 +40,13 @@ PROXY_ENV_NAMES = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
 NO_PROXY_VALUE = "localhost,127.0.0.1,::1"
 SETTINGS_DEFAULTS = {"corporateProxy": "", "proxyLogin": "", "useVpnPassword": True,
                      "appsProxy": False, "trustedCertificates": {}, "ignoreCertificates": [],
-                     "versionString": "", "localHostname": ""}
+                     "versionString": "", "localHostname": "", "noXmlPost": False,
+                     "splitRoutes": "", "reportedOs": "", "server": "", "username": "",
+                     "gatewayProxy": ""}
+# openconnect --os values; "" keeps openconnect's default (linux-64).
+REPORTED_OS = ("", "linux", "linux-64", "win", "mac-intel", "android", "apple-ios")
+# Split tunnel: at most this many networks (vpn-slice style "only these subnets").
+MAX_SPLIT_ROUTES = 64
 VERSION_STRING = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$")
 LOCAL_HOSTNAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 FINGERPRINT = re.compile(r"^(?:pin-sha256:[A-Za-z0-9+/]{43}=|sha256:[0-9a-fA-F]{64}|sha1:[0-9a-fA-F]{40})$")
@@ -42,8 +54,6 @@ FINGERPRINT = re.compile(r"^(?:pin-sha256:[A-Za-z0-9+/]{43}=|sha256:[0-9a-fA-F]{
 # and for a pinned one that no longer matches ("...match server's certificate: pin-sha256:...").
 SERVERCERT_HINT = re.compile(r"(?:--servercert[ =]+|match server's certificate:\s*)"
                              r"((?:pin-sha256|sha256|sha1):[A-Za-z0-9+/=]+)")
-NM_BUS = "org.freedesktop.NetworkManager"
-NM_SETTINGS = "/org/freedesktop/NetworkManager/Settings"
 
 
 class VpnError(Exception):
@@ -52,6 +62,10 @@ class VpnError(Exception):
 
 class VpnCancelled(VpnError):
     pass
+
+
+class MoreInputRequired(VpnError):
+    """The gateway showed another form after the password (non-interactive mode stopped)."""
 
 
 class CertificateUntrusted(VpnError):
@@ -171,72 +185,58 @@ def run(args, *, input=None, timeout=100, cancellable=True):
         raise VpnError(f"Could not start {args[0]}: {error.strerror}") from error
 
 
-def nmcli(*args, cancellable=True):
-    result = run(["nmcli", *args], cancellable=cancellable)
-    if result.returncode:
-        raise VpnError(f"NetworkManager command failed: {result.stderr.strip()}")
-    return result.stdout.strip()
+def tunnel_pid():
+    """PID of the tunnel's openconnect (started by the helper), or 0."""
+    try:
+        with open(os.path.join(TUNNEL_RUN_DIR, "openconnect.pid")) as handle:
+            pid = int(handle.read().strip())
+        with open(f"/proc/{pid}/comm") as handle:
+            return pid if handle.read().strip() == "openconnect" else 0
+    except (OSError, ValueError):
+        return 0
 
 
-def system_bus():
-    return Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+def tunnel_info():
+    """Tunnel device, VPN domain and DNS recorded by the helper's vpnc-script wrapper."""
+    try:
+        with open(os.path.join(TUNNEL_RUN_DIR, "info.json")) as handle:
+            info = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return info if isinstance(info, dict) else {}
 
 
-def profile_settings(uuid):
-    """Read a profile's non-secret settings over D-Bus without loading NM.Client."""
-    bus = system_bus()
-    path = bus.call_sync(
-        NM_BUS, NM_SETTINGS, "org.freedesktop.NetworkManager.Settings",
-        "GetConnectionByUuid", GLib.Variant("(s)", (uuid,)), GLib.VariantType("(o)"),
-        Gio.DBusCallFlags.NONE, 10000, None,
-    ).unpack()[0]
-    return bus.call_sync(
-        NM_BUS, path, "org.freedesktop.NetworkManager.Settings.Connection",
-        "GetSettings", None, GLib.VariantType("(a{sa{sv}})"),
-        Gio.DBusCallFlags.NONE, 10000, None,
-    ).unpack()[0]
-
-
-def profile_uuid():
-    profiles = nmcli("-t", "--escape", "no", "-f", "UUID,TYPE,NAME", "connection", "show")
-    matches = []
-    for line in profiles.splitlines():
-        parts = line.split(":", 2)
-        if len(parts) == 3 and parts[2] == PROFILE:
-            matches.append((parts[0], parts[1]))
-    if not matches:
-        return ""
-    if len(matches) != 1 or matches[0][1] != "vpn" or not UUID.fullmatch(matches[0][0]):
-        raise VpnError(f"Conflicting NetworkManager profile named {PROFILE}")
-    uuid = matches[0][0]
-    if profile_settings(uuid).get("vpn", {}).get("service-type") != SERVICE:
-        raise VpnError(f"Conflicting NetworkManager profile named {PROFILE}")
-    return uuid
-
-
-def is_active(uuid):
-    return uuid in nmcli("-t", "-f", "UUID", "connection", "show", "--active",
-                         cancellable=False).splitlines()
+def helper_state():
+    """missing / outdated / installed: the root-owned helper against this plugin's copy."""
+    try:
+        with open(TUNNEL_HELPER, "rb") as installed:
+            current = installed.read()
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "outdated"
+    try:
+        with open(TUNNEL_HELPER_SOURCE, "rb") as source:
+            return "installed" if source.read() == current else "outdated"
+    except OSError:
+        return "installed"
 
 
 def state():
-    uuid = profile_uuid()
-    if not uuid:
-        return {"connected": False, "server": "", "username": "", "proxy": "",
-                "certificatePinned": False, "certificateIgnored": False,
-                "settings": load_settings()}
-    vpn = profile_settings(uuid).get("vpn")
-    if vpn is None:
-        raise VpnError("NetworkManager could not read the VPN profile")
-    data = vpn.get("data", {})
+    settings = load_settings()
+    connected = bool(tunnel_pid())
+    info = tunnel_info() if connected else {}
     return {
-        "settings": load_settings(),
-        "connected": is_active(uuid),
-        "server": data.get("gateway", ""),
-        "username": vpn.get("user-name", ""),
-        "proxy": data.get("proxy", ""),
-        "certificatePinned": pinned_for(data.get("gateway", "")),
-        "certificateIgnored": ignored_for(data.get("gateway", "")),
+        "settings": settings,
+        "connected": connected,
+        "server": settings["server"],
+        "username": settings["username"],
+        "proxy": settings["gatewayProxy"],
+        "certificatePinned": pinned_for(settings["server"]),
+        "certificateIgnored": ignored_for(settings["server"]),
+        "tunnelHelper": helper_state(),
+        "vpnDevice": str(info.get("device", "")),
+        "vpnAddress": str(info.get("address", "")),
     }
 
 
@@ -373,8 +373,44 @@ def local_hostname(value):
     return value
 
 
+def split_routes(value):
+    """Parse "10.0.0.0/8, 172.16.0.0/16" into networks; empty means full tunnel."""
+    networks = []
+    for part in re.split(r"[\s,;]+", str(value).strip()):
+        if not part:
+            continue
+        try:
+            network = ipaddress.IPv4Network(part, strict=False)
+        except ValueError as error:
+            raise VpnError(f"Invalid network '{part[:50]}'; use IPv4 CIDR like 10.0.0.0/8") from error
+        if network.prefixlen == 0:
+            raise VpnError("0.0.0.0/0 sends all traffic; leave the field empty for a full tunnel")
+        if network not in networks:
+            networks.append(network)
+    if len(networks) > MAX_SPLIT_ROUTES:
+        raise VpnError(f"Enter at most {MAX_SPLIT_ROUTES} networks")
+    return networks
+
+
 def save_settings(changes):
     settings = load_settings()
+    if "server" in changes:
+        settings["server"] = server_url(str(changes["server"])) if changes["server"] else ""
+    if "username" in changes:
+        username = str(changes["username"]).strip()
+        if any(char in username for char in "\r\n"):
+            raise VpnError("Enter a valid username")
+        settings["username"] = username
+    if "gatewayProxy" in changes:
+        settings["gatewayProxy"] = proxy_url(changes["gatewayProxy"]) if changes["gatewayProxy"] else ""
+    if "reportedOs" in changes:
+        if changes["reportedOs"] not in REPORTED_OS:
+            raise VpnError("Unknown operating system to report")
+        settings["reportedOs"] = changes["reportedOs"]
+    if "noXmlPost" in changes:
+        settings["noXmlPost"] = changes["noXmlPost"] is True
+    if "splitRoutes" in changes:
+        settings["splitRoutes"] = ", ".join(str(n) for n in split_routes(changes["splitRoutes"]))
     if "versionString" in changes:
         settings["versionString"] = version_string(changes["versionString"])
     if "localHostname" in changes:
@@ -421,45 +457,6 @@ def set_apps_proxy(enable):
     return settings
 
 
-def current_user():
-    return pwd.getpwuid(os.getuid()).pw_name
-
-
-def ensure_profile(address, username, proxy):
-    uuid = profile_uuid()
-    if not uuid:
-        nmcli("connection", "add", "type", "vpn", "vpn-type", "openconnect",
-              "ifname", "*", "con-name", PROFILE, "autoconnect", "no",
-              "--", "connection.permissions", f"user:{current_user()}",
-              "vpn.data", "protocol=anyconnect")
-        uuid = profile_uuid()
-        if not uuid:
-            raise VpnError("NetworkManager did not create the VPN profile")
-    # Keep the client referenced: a RemoteConnection stops working once its
-    # NM.Client is garbage-collected ("Object is no longer in the client cache").
-    client = NM.Client.new(None)
-    connection = client.get_connection_by_uuid(uuid)
-    if connection is None or connection.get_setting_vpn() is None:
-        raise VpnError("NetworkManager could not read the VPN profile")
-    # Merge only the keys this widget owns; keep anything set elsewhere
-    # (for example cacert or useragent from nm-connection-editor).
-    vpn = connection.get_setting_vpn()
-    vpn.add_data_item("gateway", address)
-    vpn.add_data_item("protocol", "anyconnect")
-    if proxy:
-        vpn.add_data_item("proxy", proxy)
-    else:
-        vpn.remove_data_item("proxy")
-    vpn.set_property("user-name", username)
-    setting = connection.get_setting_connection()
-    setting.set_property("autoconnect", False)
-    if setting.get_num_permissions() == 0:
-        setting.add_permission("user", current_user(), None)
-    if not connection.commit_changes(True, None):
-        raise VpnError("NetworkManager did not save the VPN profile")
-    return uuid
-
-
 def certificate_host(address):
     """Key for a pinned certificate: lowercase host and port of the gateway."""
     parsed = urlsplit(server_url(address))
@@ -504,16 +501,27 @@ def authenticate_server(address, username, password, proxy):
     """Authenticate with the saved certificate policy and client identity."""
     settings = load_settings()
     identity = {"version": settings.get("versionString", ""),
-                "hostname": settings.get("localHostname", "")}
+                "hostname": settings.get("localHostname", ""),
+                "no_xmlpost": settings.get("noXmlPost", False),
+                "reported_os": settings.get("reportedOs", "")}
+
+    def attempt(servercert):
+        try:
+            return authenticate(address, username, password, proxy, servercert, **identity)
+        except MoreInputRequired:
+            # The certificate already passed in the first attempt, so answering
+            # prompts is safe now: only form fields can read the blank lines.
+            check_cancelled()
+            return authenticate(address, username, password, proxy, servercert,
+                                blank_responses=BLANK_RESPONSES, **identity)
+
     if ignores_certificate(address):
         try:
-            return authenticate(address, username, password, proxy, **identity)
+            return attempt("")
         except CertificateUntrusted as untrusted:
             # Ignore mode: accept whatever certificate the server presented.
-            return authenticate(address, username, password, proxy,
-                                untrusted.details["fingerprint"], **identity)
-    return authenticate(address, username, password, proxy, trusted_certificate(address),
-                        **identity)
+            return attempt(untrusted.details["fingerprint"])
+    return attempt(trusted_certificate(address))
 
 
 def certificate_failure(stderr, address):
@@ -564,7 +572,8 @@ def authentication_error(stderr):
     return "OpenConnect authentication failed; the gateway may require another login step"
 
 
-def authenticate(address, username, password, proxy="", servercert="", version="", hostname=""):
+def authenticate(address, username, password, proxy="", servercert="", version="", hostname="",
+                 blank_responses=0, no_xmlpost=False, reported_os=""):
     proxy_args = ["--proxy", proxy] if proxy else ["--no-proxy"]
     # --servercert accepts only this exact certificate (it implies --no-system-trust).
     cert_args = ["--servercert", servercert] if servercert else []
@@ -574,15 +583,29 @@ def authenticate(address, username, password, proxy="", servercert="", version="
         identity_args.append(f"--version-string={version_string(version)}")
     if hostname:
         identity_args.append(f"--local-hostname={local_hostname(hostname)}")
+    # Some gateways only finish the login with the older (non-XML) form POST.
+    if no_xmlpost:
+        identity_args.append("--no-xmlpost")
+    # Gateways may apply a different policy (or refuse) depending on the OS.
+    if reported_os:
+        if reported_os not in REPORTED_OS:
+            raise VpnError("Unknown operating system to report")
+        identity_args.append(f"--os={reported_os}")
+    # Normally --non-inter: any unexpected prompt (including a certificate
+    # question) fails instead of reading stdin. With blank_responses, extra
+    # form prompts after the password are answered with an empty line.
+    mode_args = [] if blank_responses else ["--non-inter"]
     result = run(
         ["openconnect", "--protocol=anyconnect", "--authenticate", *proxy_args, *cert_args,
-         *identity_args, "--non-inter", "--passwd-on-stdin", "--user", username, address],
-        input=password + "\n", timeout=90,
+         *identity_args, *mode_args, "--passwd-on-stdin", "--user", username, address],
+        input=password + "\n" + "\n" * blank_responses, timeout=90,
     )
     if result.returncode:
         untrusted = certificate_failure(result.stderr, address)
         if untrusted is not None:
             raise untrusted
+        if not blank_responses and "user input required in non-interactive mode" in result.stderr.lower():
+            raise MoreInputRequired(authentication_error(result.stderr))
         raise VpnError(authentication_error(result.stderr))
 
     values = {}
@@ -606,55 +629,57 @@ def authenticate(address, username, password, proxy="", servercert="", version="
     return values
 
 
-def clear_secrets(connection):
+# --- Tunnel (root helper: openconnect + vpnc-script) -------------------------
+
+def run_helper(action, request=None, timeout=90):
+    """Run the tunnel helper through pkexec and return its JSON reply."""
+    if helper_state() == "missing":
+        raise VpnError("Install the VPN helper first (one-time administrator step)")
+    # Not cancellable: killing pkexec mid-way could leave a half-started tunnel;
+    # a cancel during "up" is handled by bringing the tunnel down afterwards.
+    result = run(["pkexec", TUNNEL_HELPER, action],
+                 input=json.dumps(request) if request is not None else None,
+                 timeout=timeout, cancellable=False)
+    if result.returncode in (126, 127) and not result.stdout.strip():
+        raise VpnError("Administrator authorization for the VPN helper was refused; "
+                       "reinstall the VPN helper")
     try:
-        system_bus().call_sync(
-            NM_BUS, connection.get_path(),
-            "org.freedesktop.NetworkManager.Settings.Connection", "ClearSecrets",
-            None, None, Gio.DBusCallFlags.NONE, 10000, None,
-        )
-    except GLib.Error as error:
-        print(f"Could not clear VPN secrets: {error.message}", file=sys.stderr)
+        reply = json.loads(result.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError) as error:
+        raise VpnError("The VPN helper returned an invalid response") from error
+    if not isinstance(reply, dict) or reply.get("ok") is not True:
+        message = reply.get("error") if isinstance(reply, dict) else ""
+        raise VpnError(str(message or "The VPN helper failed"))
+    return reply
 
 
-def activate(uuid, values):
-    secrets = {
+def tunnel_up(values, settings, networks, proxy):
+    request = {
+        "url": values["CONNECT_URL"],
         "cookie": values["COOKIE"],
-        "gateway": values["CONNECT_URL"],
-        "gwcert": values["FINGERPRINT"],
+        "fingerprint": values["FINGERPRINT"],
+        "resolve": values.get("RESOLVE", ""),
+        "proxy": proxy,
+        "version": settings.get("versionString", ""),
+        "hostname": settings.get("localHostname", ""),
+        "os": settings.get("reportedOs", ""),
+        "routes": [str(network) for network in networks],
     }
-    if values.get("RESOLVE"):
-        secrets["resolve"] = values["RESOLVE"]
-    client = NM.Client.new(None)
-    connection = client.get_connection_by_uuid(uuid)
-    if connection is None:
-        raise VpnError("NetworkManager could not find the VPN profile")
-    vpn = connection.get_setting_vpn()
-    if vpn is None:
-        raise VpnError("NetworkManager VPN profile is invalid")
-    for key, value in secrets.items():
-        vpn.add_secret(key, value)
-    try:
-        if not connection.commit_changes(False, None):
-            raise VpnError("Could not pass VPN credentials to NetworkManager")
-        check_cancelled()
-        result = run(["nmcli", "--wait", "90", "connection", "up", "uuid", uuid])
-        if result.returncode:
-            raise VpnError(f"VPN activation failed (NetworkManager exit code {result.returncode})")
-    except VpnCancelled:
-        if is_active(uuid):
-            nmcli("connection", "down", "uuid", uuid, cancellable=False)
-        raise
-    finally:
-        clear_secrets(connection)
+    run_helper("up", request)
+    if cancel_requested:
+        run_helper("down")
+        raise VpnCancelled("Connection cancelled")
+
+
+def tunnel_down():
+    run_helper("down", timeout=30)
 
 
 # --- Corporate proxy inside the tunnel -------------------------------------
 
-def vpn_domains(uuid):
-    text = nmcli("-g", "IP4.DOMAIN,IP6.DOMAIN", "connection", "show", "uuid", uuid)
+def vpn_domains():
     domains = []
-    for part in re.split(r"[\n|]", text):
+    for part in str(tunnel_info().get("domain", "")).split():
         domain = part.strip().strip(".").lower()
         if domain and re.fullmatch(r"[a-z0-9.\-]+", domain) and domain not in domains:
             domains.append(domain)
@@ -687,8 +712,8 @@ def fetch_pac(url, timeout=3):
     return body.decode(errors="replace")
 
 
-def discover_proxy(uuid):
-    for host in wpad_candidates(vpn_domains(uuid)):
+def discover_proxy():
+    for host in wpad_candidates(vpn_domains()):
         try:
             proxy = pac_proxy(fetch_pac(f"http://{host}/wpad.dat"))
         except (OSError, VpnError, ValueError):
@@ -726,13 +751,12 @@ def probe_proxy(proxy, target="www.example.com:443", timeout=5):
 
 
 def proxy_check(request):
-    uuid = profile_uuid()
-    if not uuid or not is_active(uuid):
+    if not tunnel_pid():
         raise VpnError("Connect the VPN before checking the corporate proxy")
     proxy = corporate_proxy(str(request.get("proxy", "")))
     source = "manual"
     if not proxy:
-        proxy, source = discover_proxy(uuid)
+        proxy, source = discover_proxy()
         if not proxy:
             raise VpnError("No corporate proxy found automatically; enter it as host:port")
     try:
@@ -780,28 +804,31 @@ def main():
                 or any(char in value for value in (username, password) for char in "\r\n")):
             raise VpnError("Enter a username and password")
         proxy = resolve_proxy(request.get("proxyMode", "off"), request.get("proxyUrl", ""))
-        identity = {key: request[key] for key in ("versionString", "localHostname") if key in request}
-        if identity:
-            save_settings(identity)  # validated; remembered for the next connect
-        uuid = ensure_profile(address, username, proxy)
+        options = {key: request[key] for key in
+                   ("versionString", "localHostname", "noXmlPost", "splitRoutes", "reportedOs")
+                   if key in request}
+        if tunnel_pid():
+            raise VpnError("The VPN is already connected")
+        if helper_state() == "missing":
+            raise VpnError("Install the VPN helper first (one-time administrator step)")
+        # Validated and remembered for the next connect.
+        settings = save_settings({**options, "server": address, "username": username,
+                                  "gatewayProxy": proxy})
+        networks = split_routes(settings["splitRoutes"])
         check_cancelled()
-        activate(uuid, authenticate_server(address, username, password, proxy))
+        values = authenticate_server(address, username, password, proxy)
+        check_cancelled()
+        tunnel_up(values, settings, networks, proxy)
     elif action == "disconnect":
-        uuid = profile_uuid()
-        if not uuid:
-            raise VpnError("No Cisco VPN profile exists")
-        nmcli("connection", "down", "uuid", uuid)
+        if not tunnel_pid():
+            raise VpnError("The VPN is not connected")
+        tunnel_down()
     return state()
 
 
 if __name__ == "__main__":
     try:
         print(json.dumps({"ok": True, **main()}))
-    except GLib.Error as error:
-        # NetworkManager's message names the failing step; it carries no secrets.
-        print(json.dumps({"ok": False,
-                          "error": f"NetworkManager rejected the VPN operation: {error.message}"}))
-        sys.exit(1)
     except CertificateUntrusted as error:
         print(json.dumps({"ok": False, "error": str(error), "certificate": error.details}))
         sys.exit(1)

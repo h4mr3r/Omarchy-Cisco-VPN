@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 
-PACKAGES = ("networkmanager-openconnect", "python-gobject")
+PACKAGES = ("openconnect", "vpnc")
 
 
 def missing_packages():

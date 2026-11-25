@@ -12,8 +12,8 @@ class DependenciesTest(unittest.TestCase):
     def test_reports_only_missing_packages(self):
         with patch.object(dependencies.subprocess, "run",
                           return_value=subprocess.CompletedProcess(
-                              [], 0, "python-gobject\nother-package\n", "")) as runner:
-            self.assertEqual(dependencies.missing_packages(), ["networkmanager-openconnect"])
+                              [], 0, "vpnc\nother-package\n", "")) as runner:
+            self.assertEqual(dependencies.missing_packages(), ["openconnect"])
         runner.assert_called_once_with(
             ["pacman", "-Qq"], capture_output=True, text=True, timeout=10, check=True
         )
@@ -21,7 +21,7 @@ class DependenciesTest(unittest.TestCase):
     def test_reports_no_missing_packages(self):
         with patch.object(dependencies.subprocess, "run",
                           return_value=subprocess.CompletedProcess(
-                              [], 0, "networkmanager-openconnect\npython-gobject\n", "")):
+                              [], 0, "openconnect\nvpnc\n", "")):
             self.assertEqual(dependencies.missing_packages(), [])
 
     def test_package_query_failure_is_not_treated_as_missing(self):

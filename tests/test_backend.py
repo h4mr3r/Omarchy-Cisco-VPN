@@ -1,4 +1,5 @@
 import io
+import os
 import json
 import pathlib
 import subprocess
@@ -39,58 +40,6 @@ class BackendTest(unittest.TestCase):
     def test_run_still_times_out_without_output(self):
         with self.assertRaisesRegex(backend.VpnError, "timed out"):
             backend.run([sys.executable, "-c", "import time; time.sleep(2)"], timeout=0.1)
-
-    def test_status_reads_gateway_and_proxy_from_vpn_data(self):
-        settings = {"vpn": {"user-name": "name", "data": {
-            "gateway": "https://vpn.example.com", "proxy": "http://proxy.example.com:8080"}}}
-        with patch.object(backend, "profile_uuid", return_value="test-uuid"), patch.object(
-                backend, "profile_settings", return_value=settings), patch.object(
-                backend, "nmcli", return_value="test-uuid"), patch.object(
-                backend, "load_settings", return_value={}), patch.object(
-                backend.NM.Client, "new") as client:
-            self.assertEqual(backend.state(), {
-                "connected": True, "server": "https://vpn.example.com", "username": "name",
-                "proxy": "http://proxy.example.com:8080", "settings": {}, "certificatePinned": False,
-                "certificateIgnored": False,
-            })
-        client.assert_not_called()
-
-    def profile_mocks(self, data, permissions=0):
-        vpn = backend.NM.SettingVpn.new()
-        for key, value in data.items():
-            vpn.add_data_item(key, value)
-        setting = Mock()
-        setting.get_num_permissions.return_value = permissions
-        connection = Mock()
-        connection.get_setting_vpn.return_value = vpn
-        connection.get_setting_connection.return_value = setting
-        connection.commit_changes.return_value = True
-        client = Mock()
-        client.get_connection_by_uuid.return_value = connection
-        return vpn, setting, connection, client
-
-    def test_existing_profile_merges_owned_keys_and_keeps_others(self):
-        vpn, setting, connection, client = self.profile_mocks(
-            {"gateway": "https://old.example.com", "cacert": "/etc/ca.pem",
-             "proxy": "http://old:1"})
-        with patch.object(backend, "profile_uuid", return_value="test-uuid"), patch.object(
-                backend.NM.Client, "new", return_value=client), patch.object(
-                backend, "current_user", return_value="me"):
-            backend.ensure_profile("https://vpn.example.com/a,b", "name", "")
-        self.assertEqual(vpn.get_data_item("gateway"), "https://vpn.example.com/a,b")
-        self.assertEqual(vpn.get_data_item("cacert"), "/etc/ca.pem")
-        self.assertIsNone(vpn.get_data_item("proxy"))
-        self.assertEqual(vpn.get_user_name(), "name")
-        setting.add_permission.assert_called_once_with("user", "me", None)
-        connection.commit_changes.assert_called_once_with(True, None)
-
-    def test_profile_stores_proxy_and_keeps_existing_permissions(self):
-        vpn, setting, _, client = self.profile_mocks({}, permissions=1)
-        with patch.object(backend, "profile_uuid", return_value="test-uuid"), patch.object(
-                backend.NM.Client, "new", return_value=client):
-            backend.ensure_profile("https://vpn.example.com", "name", "http://proxy.example.com:8080")
-        self.assertEqual(vpn.get_data_item("proxy"), "http://proxy.example.com:8080")
-        setting.add_permission.assert_not_called()
 
     def test_proxy_url_validation(self):
         self.assertEqual(backend.proxy_url("proxy.example.com:8080"), "http://proxy.example.com:8080")
@@ -167,52 +116,6 @@ class BackendTest(unittest.TestCase):
         self.assertNotIn("private-password", runner.call_args.args[0])
         self.assertEqual(runner.call_args.kwargs["input"], "private-password\n")
 
-    def test_activation_passes_secrets_only_to_nm_memory(self):
-        values = {"COOKIE": "private-cookie", "CONNECT_URL": "https://vpn.example.com",
-                  "FINGERPRINT": "sha256:abc"}
-        setting = Mock()
-        connection = Mock()
-        connection.get_setting_vpn.return_value = setting
-        connection.commit_changes.return_value = True
-        client = Mock()
-        client.get_connection_by_uuid.return_value = connection
-        bus = Mock()
-        with patch.object(backend.NM.Client, "new", return_value=client), patch.object(
-                backend.Gio, "bus_get_sync", return_value=bus), patch.object(
-                backend, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as runner:
-            backend.activate("00000000-0000-0000-0000-000000000000", values)
-        setting.add_secret.assert_any_call("cookie", "private-cookie")
-        self.assertEqual(bus.call_sync.call_args.args[3], "ClearSecrets")
-        self.assertEqual(connection.commit_changes.call_count, 1)
-        self.assertEqual(connection.commit_changes.call_args.args, (False, None))
-        self.assertNotIn("private-cookie", " ".join(runner.call_args.args[0]))
-
-    def test_cancel_during_activation_brings_tunnel_down_and_clears_secrets(self):
-        values = {"COOKIE": "c", "CONNECT_URL": "https://vpn.example.com", "FINGERPRINT": "f"}
-        connection = Mock()
-        connection.get_setting_vpn.return_value = Mock()
-        connection.commit_changes.return_value = True
-        client = Mock()
-        client.get_connection_by_uuid.return_value = connection
-        bus = Mock()
-        with patch.object(backend.NM.Client, "new", return_value=client), patch.object(
-                backend.Gio, "bus_get_sync", return_value=bus), patch.object(
-                backend, "run", side_effect=backend.VpnCancelled("Connection cancelled")), patch.object(
-                backend, "is_active", return_value=True), patch.object(
-                backend, "nmcli") as nmcli:
-            with self.assertRaises(backend.VpnCancelled):
-                backend.activate("00000000-0000-0000-0000-000000000000", values)
-        nmcli.assert_called_once_with("connection", "down", "uuid",
-                                      "00000000-0000-0000-0000-000000000000", cancellable=False)
-        self.assertEqual(bus.call_sync.call_args.args[3], "ClearSecrets")
-
-    def test_clear_secrets_failure_does_not_mask_errors(self):
-        bus = Mock()
-        bus.call_sync.side_effect = backend.GLib.Error("boom")
-        with patch.object(backend.Gio, "bus_get_sync", return_value=bus), patch.object(
-                sys, "stderr", io.StringIO()):
-            backend.clear_secrets(Mock())
-
     def test_failed_authentication_never_exposes_cookie(self):
         with patch.object(backend, "run",
                           return_value=subprocess.CompletedProcess([], 2, "", "private-password")):
@@ -240,9 +143,11 @@ class BackendTest(unittest.TestCase):
         stdin = io.StringIO(json.dumps(request) + "\nextra input")
         with patch.object(sys, "argv", ["backend.py", "connect"]), patch.object(
                 sys, "stdin", stdin), patch.object(
-                backend, "ensure_profile", return_value="uuid"), patch.object(
+                backend, "tunnel_pid", return_value=0), patch.object(
+                backend, "helper_state", return_value="installed"), patch.object(
+                backend, "save_settings", return_value=dict(backend.SETTINGS_DEFAULTS)), patch.object(
                 backend, "authenticate", return_value={"COOKIE": "cookie"}), patch.object(
-                backend, "activate"), patch.object(
+                backend, "tunnel_up"), patch.object(
                 backend, "state", return_value={"connected": True}) as state:
             self.assertEqual(backend.main(), state.return_value)
         self.assertEqual(stdin.read(), "extra input")
@@ -460,13 +365,209 @@ class BackendTest(unittest.TestCase):
                 backend.os.environ, {"XDG_STATE_HOME": home}), patch.object(
                 sys, "argv", ["backend.py", "connect"]), patch.object(
                 sys, "stdin", io.StringIO(json.dumps(request) + "\n")), patch.object(
-                backend, "ensure_profile", return_value="uuid"), patch.object(
+                backend, "tunnel_pid", return_value=0), patch.object(
+                backend, "helper_state", return_value="installed"), patch.object(
                 backend, "authenticate", return_value={"COOKIE": "c"}) as auth, patch.object(
-                backend, "activate"), patch.object(backend, "state", return_value={}):
+                backend, "tunnel_up"), patch.object(backend, "state", return_value={}):
             backend.main()
-            self.assertEqual(auth.call_args.kwargs, {"version": "5.1.15.287", "hostname": "hostname"})
+            self.assertEqual(auth.call_args.kwargs, {"version": "5.1.15.287", "hostname": "hostname",
+                                                     "no_xmlpost": False, "reported_os": ""})
             saved = backend.load_settings()
         self.assertEqual((saved["versionString"], saved["localHostname"]), ("5.1.15.287", "hostname"))
+
+    def test_extra_prompt_is_answered_with_enter_on_retry(self):
+        import tempfile
+        stalled = subprocess.CompletedProcess(
+            [], 1, "", "Username:Password:\nUser input required in non-interactive mode\n")
+        ok = subprocess.CompletedProcess(
+            [], 0, "COOKIE='c'\nCONNECT_URL='https://vpn.example.com'\nFINGERPRINT='f'\n", "")
+        with tempfile.TemporaryDirectory() as home, patch.dict(
+                backend.os.environ, {"XDG_STATE_HOME": home}), patch.object(
+                backend, "run", side_effect=[stalled, ok]) as runner:
+            values = backend.authenticate_server("https://vpn.example.com", "name", "pw", "")
+        self.assertEqual(values["COOKIE"], "c")
+        first, second = (call.args[0] for call in runner.call_args_list)
+        self.assertIn("--non-inter", first)
+        self.assertNotIn("--non-inter", second)
+        self.assertEqual(runner.call_args_list[0].kwargs["input"], "pw\n")
+        self.assertEqual(runner.call_args_list[1].kwargs["input"], "pw\n\n\n\n")
+
+    def test_failed_retry_reports_login_failure(self):
+        import tempfile
+        stalled = subprocess.CompletedProcess(
+            [], 1, "", "User input required in non-interactive mode\n")
+        failed = subprocess.CompletedProcess(
+            [], 1, "", "Login failed.\nUsername:Password:\nfgets (stdin): Inappropriate ioctl\n")
+        with tempfile.TemporaryDirectory() as home, patch.dict(
+                backend.os.environ, {"XDG_STATE_HOME": home}), patch.object(
+                backend, "run", side_effect=[stalled, failed]) as runner:
+            with self.assertRaisesRegex(backend.VpnError, "rejected the credentials"):
+                backend.authenticate_server("https://vpn.example.com", "name", "pw", "")
+        self.assertEqual(runner.call_count, 2)
+
+
+    def test_no_xmlpost_is_passed_only_when_enabled(self):
+        text = "COOKIE='c'\nCONNECT_URL='https://vpn.example.com'\nFINGERPRINT='f'\n"
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled), patch.object(
+                    backend, "run",
+                    return_value=subprocess.CompletedProcess([], 0, text, "")) as runner:
+                backend.authenticate("https://vpn.example.com", "name", "pw", no_xmlpost=enabled)
+                argv = runner.call_args.args[0]
+                self.assertEqual("--no-xmlpost" in argv, enabled)
+                if enabled:
+                    self.assertLess(argv.index("--no-xmlpost"), argv.index("--user"))
+
+    def test_split_routes_validation(self):
+        networks = backend.split_routes(" 10.1.2.3/8, 172.16.0.0/16;10.0.0.0/8 ")
+        self.assertEqual([str(n) for n in networks], ["10.0.0.0/8", "172.16.0.0/16"])
+        self.assertEqual(backend.split_routes(""), [])
+        # IPv6 is disabled in the tunnel, so only IPv4 networks are accepted.
+        for value in ("10.0.0.0/33", "not-a-net", "0.0.0.0/0", "fd00::/8", "--script=x"):
+            with self.subTest(value=value), self.assertRaises(backend.VpnError):
+                backend.split_routes(value)
+        with self.assertRaises(backend.VpnError):
+            backend.split_routes(",".join(f"10.{i}.0.0/16" for i in range(65)))
+
+    def test_reported_os_is_validated_and_passed(self):
+        import tempfile
+        text = "COOKIE='c'\nCONNECT_URL='https://vpn.example.com'\nFINGERPRINT='f'\n"
+        with patch.object(backend, "run",
+                          return_value=subprocess.CompletedProcess([], 0, text, "")) as runner:
+            backend.authenticate("https://vpn.example.com", "name", "pw", reported_os="win")
+        argv = runner.call_args.args[0]
+        self.assertLess(argv.index("--os=win"), argv.index("--user"))
+        with self.assertRaises(backend.VpnError):
+            backend.authenticate("https://vpn.example.com", "name", "pw", reported_os="--script=x")
+        with tempfile.TemporaryDirectory() as home, patch.dict(
+                backend.os.environ, {"XDG_STATE_HOME": home}):
+            self.assertEqual(backend.save_settings({"reportedOs": "win"})["reportedOs"], "win")
+            with self.assertRaises(backend.VpnError):
+                backend.save_settings({"reportedOs": "windows; rm"})
+
+
+    # --- tunnel through the root helper -----------------------------------
+
+    AUTH = {"COOKIE": "webvpn=abc", "CONNECT_URL": "https://gw.example.com",
+            "FINGERPRINT": "pin-sha256:" + "A" * 43 + "=", "RESOLVE": "gw.example.com:192.0.2.1"}
+
+    def test_connect_logs_in_as_user_then_starts_tunnel_with_settings(self):
+        import tempfile
+        request = {"server": "gw.example.com", "username": "name", "password": "secret",
+                   "noXmlPost": True, "reportedOs": "win", "versionString": "5.1.21.2728",
+                   "splitRoutes": "172.16.0.0/16, 10.0.0.0/8"}
+        with tempfile.TemporaryDirectory() as home, patch.dict(
+                backend.os.environ, {"XDG_STATE_HOME": home}), patch.object(
+                sys, "argv", ["backend.py", "connect"]), patch.object(
+                sys, "stdin", io.StringIO(json.dumps(request) + "\n")), patch.object(
+                backend, "tunnel_pid", return_value=0), patch.object(
+                backend, "helper_state", return_value="installed"), patch.object(
+                backend, "authenticate", return_value=dict(self.AUTH)) as auth, patch.object(
+                backend, "run_helper", return_value={"ok": True}) as helper, patch.object(
+                backend, "state", return_value={}):
+            backend.main()
+            saved = backend.load_settings()
+        self.assertEqual(auth.call_args.kwargs["reported_os"], "win")
+        self.assertTrue(auth.call_args.kwargs["no_xmlpost"])
+        action, tunnel = helper.call_args.args
+        self.assertEqual(action, "up")
+        self.assertEqual(tunnel, {
+            "url": "https://gw.example.com", "cookie": "webvpn=abc",
+            "fingerprint": self.AUTH["FINGERPRINT"], "resolve": "gw.example.com:192.0.2.1",
+            "proxy": "", "version": "5.1.21.2728", "hostname": "", "os": "win",
+            "routes": ["172.16.0.0/16", "10.0.0.0/8"]})
+        self.assertNotIn("secret", json.dumps(tunnel))
+        self.assertEqual((saved["server"], saved["username"]), ("https://gw.example.com", "name"))
+
+    def test_connect_requires_installed_helper_before_login(self):
+        request = {"server": "gw.example.com", "username": "name", "password": "secret"}
+        with patch.object(sys, "argv", ["backend.py", "connect"]), patch.object(
+                sys, "stdin", io.StringIO(json.dumps(request) + "\n")), patch.object(
+                backend, "tunnel_pid", return_value=0), patch.object(
+                backend, "helper_state", return_value="missing"), patch.object(
+                backend, "authenticate") as auth:
+            with self.assertRaisesRegex(backend.VpnError, "Install the VPN helper"):
+                backend.main()
+        auth.assert_not_called()
+
+    def test_invalid_split_routes_stop_before_login(self):
+        import tempfile
+        request = {"server": "gw.example.com", "username": "name", "password": "secret",
+                   "splitRoutes": "10.0.0.0/99"}
+        with tempfile.TemporaryDirectory() as home, patch.dict(
+                backend.os.environ, {"XDG_STATE_HOME": home}), patch.object(
+                sys, "argv", ["backend.py", "connect"]), patch.object(
+                sys, "stdin", io.StringIO(json.dumps(request) + "\n")), patch.object(
+                backend, "tunnel_pid", return_value=0), patch.object(
+                backend, "helper_state", return_value="installed"), patch.object(
+                backend, "authenticate") as auth:
+            with self.assertRaisesRegex(backend.VpnError, "Invalid network"):
+                backend.main()
+        auth.assert_not_called()
+
+    def test_cancel_during_tunnel_start_brings_it_down(self):
+        with patch.object(backend, "run_helper", return_value={"ok": True}) as helper, patch.object(
+                backend, "cancel_requested", True):
+            with self.assertRaises(backend.VpnCancelled):
+                backend.tunnel_up(dict(self.AUTH), dict(backend.SETTINGS_DEFAULTS), [], "")
+        self.assertEqual([call.args[0] for call in helper.call_args_list], ["up", "down"])
+
+    def test_run_helper_uses_pkexec_and_reports_helper_errors(self):
+        reply = subprocess.CompletedProcess([], 1, '{"ok": false, "error": "Could not reach the VPN server"}\n', "")
+        with patch.object(backend, "helper_state", return_value="installed"), patch.object(
+                backend, "run", return_value=reply) as runner:
+            with self.assertRaisesRegex(backend.VpnError, "Could not reach the VPN server"):
+                backend.run_helper("up", {"url": "x"})
+        argv = runner.call_args.args[0]
+        self.assertEqual(argv, ["pkexec", backend.TUNNEL_HELPER, "up"])
+        self.assertEqual(json.loads(runner.call_args.kwargs["input"]), {"url": "x"})
+        self.assertFalse(runner.call_args.kwargs["cancellable"])
+
+    def test_run_helper_explains_refused_authorization(self):
+        with patch.object(backend, "helper_state", return_value="installed"), patch.object(
+                backend, "run", return_value=subprocess.CompletedProcess([], 126, "", "")):
+            with self.assertRaisesRegex(backend.VpnError, "reinstall the VPN helper"):
+                backend.run_helper("down")
+
+    def test_status_reads_saved_server_and_tunnel_state(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as home, patch.dict(
+                backend.os.environ, {"XDG_STATE_HOME": home}), patch.object(
+                backend, "tunnel_pid", return_value=1234), patch.object(
+                backend, "tunnel_info", return_value={"device": "tun0", "address": "172.16.195.3"}), patch.object(
+                backend, "helper_state", return_value="installed"):
+            backend.save_settings({"server": "gw.example.com", "username": "name",
+                                   "gatewayProxy": "http://proxy.example.com:8080"})
+            status = backend.state()
+        self.assertEqual({k: status[k] for k in ("connected", "server", "username", "proxy",
+                                                 "tunnelHelper", "vpnDevice", "vpnAddress")},
+                         {"connected": True, "server": "https://gw.example.com", "username": "name",
+                          "proxy": "http://proxy.example.com:8080", "tunnelHelper": "installed",
+                          "vpnDevice": "tun0", "vpnAddress": "172.16.195.3"})
+
+    def test_tunnel_pid_requires_a_live_openconnect(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as run_dir, patch.object(backend, "TUNNEL_RUN_DIR", run_dir):
+            self.assertEqual(backend.tunnel_pid(), 0)
+            with open(os.path.join(run_dir, "openconnect.pid"), "w") as handle:
+                handle.write(f"{os.getpid()}\n")  # alive, but not openconnect
+            self.assertEqual(backend.tunnel_pid(), 0)
+
+    def test_helper_state_compares_installed_copy(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            source, target = os.path.join(tmp, "source.py"), os.path.join(tmp, "target")
+            with open(source, "w") as handle:
+                handle.write("v2\n")
+            with patch.object(backend, "TUNNEL_HELPER_SOURCE", source), patch.object(
+                    backend, "TUNNEL_HELPER", target):
+                self.assertEqual(backend.helper_state(), "missing")
+                with open(target, "w") as handle:
+                    handle.write("v1\n")
+                self.assertEqual(backend.helper_state(), "outdated")
+                with open(target, "w") as handle:
+                    handle.write("v2\n")
+                self.assertEqual(backend.helper_state(), "installed")
 
 
 if __name__ == "__main__":

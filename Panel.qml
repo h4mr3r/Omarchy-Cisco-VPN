@@ -22,6 +22,9 @@ Panel {
   property bool proxyDirty: false
   property string versionString: ""
   property string localHostname: ""
+  property bool noXmlPost: false
+  property string splitRoutes: ""
+  property string reportedOs: ""
   property bool identityDirty: false
   property bool proxyExpanded: false
   property bool proxyChecking: false
@@ -48,6 +51,12 @@ Panel {
   property string lastConnectRequest: ""
   property bool certificatePinned: false
   property bool certificateIgnored: false
+  // Root-owned tunnel helper (openconnect + vpnc-script): "", "missing", "outdated" or "installed".
+  property string tunnelHelper: ""
+  readonly property bool helperReady: tunnelHelper !== "missing" && tunnelHelper !== "outdated"
+  property string vpnDevice: ""
+  property string vpnAddress: ""
+  readonly property string helperInstaller: Qt.resolvedUrl("install-helper.sh").toString().replace(/^file:\/\//, "")
   readonly property bool forwarderWanted: dependenciesReady && (appsProxy || connected)
   readonly property string forwarderHelper: Qt.resolvedUrl("proxy_forwarder.py").toString().replace(/^file:\/\//, "")
   property bool dependenciesKnown: false
@@ -69,6 +78,14 @@ Panel {
     statusProcess.running = true
   }
 
+  function installHelper() {
+    if (busy || helperProcess.running) return
+    busy = true
+    action = "helper"
+    errorText = ""
+    helperProcess.running = true
+  }
+
   function installDependencies() {
     if (busy || dependenciesReady || !dependenciesKnown) return
     busy = true
@@ -88,6 +105,9 @@ Panel {
       connected = data.connected === true
       certificatePinned = data.certificatePinned === true
       certificateIgnored = data.certificateIgnored === true
+      tunnelHelper = data.tunnelHelper || ""
+      vpnDevice = data.vpnDevice || ""
+      vpnAddress = data.vpnAddress || ""
       if (data.settings && (!opened || !settingsLoaded)) applySettings(data.settings)
       if (showError && data.connected === true) {
         serverDirty = false
@@ -117,6 +137,9 @@ Panel {
     if (!identityDirty) {
       versionString = settings.versionString || ""
       localHostname = settings.localHostname || ""
+      noXmlPost = settings.noXmlPost === true
+      splitRoutes = settings.splitRoutes || ""
+      reportedOs = settings.reportedOs || ""
     }
     settingsLoaded = true
     syncForwarder()
@@ -216,7 +239,10 @@ Panel {
       proxyMode: proxyMode,
       proxyUrl: proxyField.text.trim(),
       versionString: versionField.text.trim(),
-      localHostname: hostnameField.text.trim()
+      localHostname: hostnameField.text.trim(),
+      noXmlPost: noXmlPost,
+      reportedOs: reportedOs,
+      splitRoutes: splitRoutesField.text.trim()
     }))
     passwordField.text = ""
   }
@@ -354,7 +380,7 @@ Panel {
           if (root.opened) Qt.callLater(function() { serverField.forceActiveFocus() })
         }
       } catch (error) {
-        root.errorText = "Could not check installed packages; run omarchy pkg add networkmanager-openconnect python-gobject in a terminal"
+        root.errorText = "Could not check installed packages; run omarchy pkg add openconnect vpnc in a terminal"
       }
     }
   }
@@ -362,12 +388,25 @@ Panel {
   Process {
     id: installProcess
     command: ["pkexec", "/usr/share/omarchy/bin/omarchy-pkg-add",
-              "networkmanager-openconnect", "python-gobject"]
+              "openconnect", "vpnc"]
     onExited: function(code) {
       root.busy = false
       root.dependenciesKnown = false
       if (code !== 0)
-        root.errorText = "Installation failed or was cancelled; try again or run omarchy pkg add networkmanager-openconnect python-gobject in a terminal"
+        root.errorText = "Installation failed or was cancelled; try again or run omarchy pkg add openconnect vpnc in a terminal"
+      root.refresh()
+    }
+  }
+
+  Process {
+    id: helperProcess
+    // One-time administrator step: copies tunnel-helper.py to a root-owned
+    // path and adds a polkit rule so this user can run it without a password.
+    command: ["pkexec", "/bin/sh", root.helperInstaller]
+    onExited: function(code) {
+      root.busy = false
+      root.action = ""
+      if (code !== 0) root.errorText = "The VPN helper was not installed (authentication failed or was cancelled)"
       root.refresh()
     }
   }
@@ -513,17 +552,19 @@ Panel {
       spacing: Style.space(8)
 
       Text {
-        text: root.busy ? (root.action === "connect" ? "Cisco VPN · Connecting…" : (root.action === "install" ? "Cisco VPN · Installing packages…" : "Cisco VPN · Disconnecting…")) : (root.connected ? "Cisco VPN · Connected" : "Cisco VPN · Disconnected")
+        text: root.busy ? (root.action === "connect" ? "Cisco VPN · Connecting…" : (root.action === "install" ? "Cisco VPN · Installing packages…" : (root.action === "helper" ? "Cisco VPN · Installing VPN helper…" : "Cisco VPN · Disconnecting…"))) : (root.connected ? "Cisco VPN · Connected" : "Cisco VPN · Disconnected")
         color: root.barForeground
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
         font.pixelSize: Style.font.body
       }
 
       Text {
-        visible: root.dependenciesReady
+        visible: root.dependenciesReady && root.connected && root.vpnDevice !== ""
         width: parent.width
         wrapMode: Text.WordWrap
-        text: "Connect updates NetworkManager profile “Omarchy Cisco VPN” (server and username)"
+        textFormat: Text.PlainText
+        text: "Tunnel " + root.vpnDevice + (root.vpnAddress !== "" ? " · " + root.vpnAddress : "")
+              + (root.splitRoutes !== "" ? " · routes " + root.splitRoutes : " · all traffic")
         color: root.barForeground
         opacity: 0.65
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -539,6 +580,19 @@ Panel {
         color: root.barForeground
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
         font.pixelSize: Style.font.body
+      }
+
+      Text {
+        visible: root.dependenciesReady && !root.helperReady && !root.connected
+        width: parent.width
+        wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
+        text: (root.tunnelHelper === "outdated" ? "The VPN helper changed and needs updating. "
+                                                : "One-time setup: the tunnel runs openconnect with vpnc-script as root, like in a terminal. ")
+              + "Install VPN helper adds a root-owned helper and lets your user start it without a password (administrator authentication once)."
+        color: root.barForeground
+        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+        font.pixelSize: Style.font.bodySmall
       }
 
       TextField {
@@ -604,7 +658,65 @@ Panel {
           if (root.opened) root.identityDirty = true
           root.localHostname = text
         }
+        onAccepted: splitRoutesField.forceActiveFocus()
+      }
+
+      TextField {
+        id: splitRoutesField
+        visible: root.dependenciesReady && !root.connected
+        width: parent.width
+        placeholderText: "Route only these networks, e.g. 10.0.0.0/8, 172.16.0.0/16 (blank = all traffic)"
+        text: root.splitRoutes
+        enabled: !root.busy
+        onTextChanged: {
+          if (root.opened) root.identityDirty = true
+          root.splitRoutes = text
+        }
         onAccepted: root.connectVpn()
+      }
+
+      Text {
+        visible: root.dependenciesReady && !root.connected
+        text: "Report operating system"
+        color: root.barForeground
+        opacity: 0.65
+        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+        font.pixelSize: Style.font.bodySmall
+      }
+
+      ButtonGroup {
+        visible: root.dependenciesReady && !root.connected
+        enabled: !root.busy
+        focusable: false
+        options: [
+          { value: "", label: "Linux" },
+          { value: "win", label: "Windows" },
+          { value: "mac-intel", label: "macOS" }
+        ]
+        value: root.reportedOs
+        foreground: root.barForeground
+        fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+        fontSize: Style.font.bodySmall
+        onChanged: function(value) {
+          root.reportedOs = value
+          root.identityDirty = true
+        }
+      }
+
+      Toggle {
+        visible: root.dependenciesReady && !root.connected
+        width: parent.width
+        label: "Use legacy login (--no-xmlpost)"
+        description: "For gateways that reject the XML sign-in form. Saved on the next connect."
+        checked: root.noXmlPost
+        enabled: !root.busy
+        foreground: root.barForeground
+        fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+        titleSize: Style.font.bodySmall
+        onClicked: {
+          root.noXmlPost = !root.noXmlPost
+          root.identityDirty = true
+        }
       }
 
       Button {
@@ -882,7 +994,10 @@ Panel {
 
         Text {
           anchors.centerIn: parent
-          text: root.busy ? (root.action === "connect" ? (root.cancelRequested ? "Cancelling…" : "Cancel") : "Working…") : (!root.dependenciesReady ? "Install packages" : (root.connected ? "Disconnect" : "Connect"))
+          text: root.busy ? (root.action === "connect" ? (root.cancelRequested ? "Cancelling…" : "Cancel") : "Working…")
+                : (!root.dependenciesReady ? "Install packages"
+                : (root.connected ? "Disconnect"
+                : (!root.helperReady ? (root.tunnelHelper === "outdated" ? "Update VPN helper" : "Install VPN helper") : "Connect")))
           color: Color.background
           font.family: root.bar ? root.bar.fontFamily : Style.font.family
         }
@@ -890,7 +1005,10 @@ Panel {
           anchors.fill: parent
           enabled: (!root.busy && root.dependenciesKnown) || (root.action === "connect" && !root.cancelRequested)
           cursorShape: Qt.PointingHandCursor
-          onClicked: root.busy ? root.cancelVpn() : (!root.dependenciesReady ? root.installDependencies() : (root.connected ? root.disconnectVpn() : root.connectVpn()))
+          onClicked: root.busy ? root.cancelVpn()
+                     : (!root.dependenciesReady ? root.installDependencies()
+                     : (root.connected ? root.disconnectVpn()
+                     : (!root.helperReady ? root.installHelper() : root.connectVpn())))
         }
       }
     }
